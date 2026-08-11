@@ -1,0 +1,16 @@
+# Stage-I（视觉+拼音）必需
+torch>=2.1
+numpy>=1.24
+pypinyin>=0.49
+PyYAML>=6.0
+
+# Stage-II（LLM 精化）必需；只跑 ngram 基线时可不装
+transformers>=4.44
+peft>=0.11
+accelerate>=0.30
+
+# 可选
+# opencv-python>=4.8   # 读取视频、渲染 ROI96
+# mediapipe>=0.10      # 从原始视频抽取 Face Landmarker 轨迹
+# ms-swift>=3.0        # 论文使用的微调框架（本仓库自带等价实现）
+# deepspeed>=0.14      # 多卡 LoRA 训练

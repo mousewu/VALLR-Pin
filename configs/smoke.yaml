@@ -1,0 +1,33 @@
+# 合成数据上的小规模配置，用于验证实现是否跑通（CPU 上几分钟量级）。
+train_manifest: data/synth/train.jsonl
+dev_manifest: data/synth/dev.jsonl
+data_root: data/synth
+out_dir: exp/smoke
+
+epochs: 20
+batch_size: 8
+accum_steps: 1
+lr: 1.0e-3
+warmup_steps: 100
+num_workers: 0
+crop_size: 32
+device: auto
+amp: false
+save_every: 5
+keep_ckpts: 4
+eval_every: 1
+
+model:
+  d_model: 128
+  heads: 4
+  ffn: 512
+  enc_layers: 4
+  char_dec_layers: 0
+  pinyin_dec_layers: 0
+  sanm_kernel: 7
+  dropout: 0.1
+  frontend: resnet18
+  frontend_width: 16
+  lambda_ctc: 1.0
+  alpha: 0.1
+  architecture_version: 2

@@ -1,0 +1,45 @@
+# ---- 公开仓库只发布代码与文档 ----
+# 本地数据、公开视频、字幕、派生张量、报告和数据库均不分发。
+data/*
+!data/README.md
+models/
+harvest/
+
+# 论文 PDF 不随仓库重新分发；README 使用论文公开链接。
+*.pdf
+
+# 下载的模型权重与运行产物。
+*.model
+*.task
+*.onnx
+*.safetensors
+*.bin
+
+# 旧的数据管线独立仓库，不嵌套进本仓库。
+VSR-Data-Pipeline/
+
+# ---- 实验产物 ----
+exp/
+*.pt
+*.ckpt
+*.log
+runs/
+outputs/
+
+# 本机数据路径配置。
+configs/*.local.yaml
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+build/
+dist/
+.coverage
+htmlcov/
+
+# ---- 系统 ----
+.DS_Store

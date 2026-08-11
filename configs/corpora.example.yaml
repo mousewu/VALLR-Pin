@@ -1,0 +1,53 @@
+# Copy this file, replace paths/field mappings after inspecting your release,
+# then run: python scripts/build_stage1_manifests.py configs/corpora.local.yaml
+out_dir: data/stage1
+seed: 2026
+dev_speaker_percent: 5
+test_speaker_percent: 5
+min_chars: 2
+max_chars: 80
+min_frames_per_label: 1.5
+allow_pseudo: false
+min_pseudo_confidence: 0.95
+require_speaker: true
+
+sources:
+  # CN-CVS releases may ship JSONL, TSV, or Kaldi-style metadata. Select the
+  # matching adapter; do not assume this example's filenames are universal.
+  - name: cn_cvs
+    root: /DATA/CN-CVS
+    annotation: metadata/train.tsv
+    format: delimited
+    delimiter: "\t"
+    id_column: 0
+    text_column: 1
+    speaker_column: 2
+    video_column: 3       # set -1 when media is resolved by utterance id
+    default_split: train
+    media_root: roi96
+    media_glob: "**/*.npy"
+    supervision: supervised
+
+  - name: cmlr
+    root: /DATA/CMLR
+    annotation: metadata.jsonl
+    format: jsonl
+    id_field: id
+    text_field: text
+    video_field: video
+    speaker_field: speaker_id
+    split_field: split
+    media_root: roi96
+    media_glob: "**/*.npy"
+    supervision: supervised
+
+  # CN-Celeb-AV/CNC-AV is not a supervised VSR source unless sentence-level
+  # transcripts exist. Keep it disabled until reliable pseudo labels are made.
+  - name: cnc_av_pseudo
+    root: /DATA/CNC-AV
+    annotation: pseudo_labels.jsonl
+    format: jsonl
+    supervision: pseudo
+    pseudo_confidence: 0.0
+    media_root: roi96
+    media_glob: "**/*.npy"

@@ -1,0 +1,40 @@
+# Stage-I 训练配置：对标论文在 CNVSRC 固定赛道 (S3) 上的设置。
+# 数据请先转成 manifest jsonl（见 scripts/prepare_manifest.py）。
+train_manifest: data/cnvsrc/train.jsonl
+dev_manifest: data/cnvsrc/multi_dev.jsonl
+data_root: data/cnvsrc
+out_dir: exp/vallr_pin_cnvsrc
+
+epochs: 75
+batch_size: 8            # 单卡 A100-80G 的经验值；显存不足时配合 accum_steps
+accum_steps: 4
+lr: 1.0e-3               # Noam 式 warmup + 1/sqrt(step) 衰减
+warmup_steps: 10000
+weight_decay: 0.01
+grad_clip: 5.0
+num_workers: 8
+crop_size: 88
+time_mask: 4             # 时域随机遮蔽，缓解多说话人过拟合
+device: auto
+amp: true
+save_every: 5            # 每 5 epoch 存一个检查点 -> Stage-II 的 error-aware 数据源
+keep_ckpts: 8
+eval_every: 1
+seed: 0
+
+model:
+  d_model: 512
+  heads: 8
+  ffn: 2048
+  enc_layers: 12         # SANM encoder (Paraformer 规格)
+  char_dec_layers: 0     # v2 为纯 CTC；字段仅用于旧配置兼容
+  pinyin_dec_layers: 0
+  sanm_kernel: 11
+  dropout: 0.1
+  frontend: resnet50     # 论文用 ResNet-50；显存紧张可换 resnet18
+  frontend_width: 64
+  in_channels: 1
+  lambda_ctc: 1.0        # v2 固定为 CTC
+  alpha: 0.1             # 字符仅作辅助；90% 权重用于无声调拼音 CTC
+  label_smoothing: 0.0
+  architecture_version: 2

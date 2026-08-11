@@ -1,0 +1,56 @@
+# Production starting point for ROI96 .npy manifests built by
+# scripts/build_stage1_manifests.py. batch_size is per GPU.
+train_manifest: data/stage1/train.jsonl
+dev_manifest: data/stage1/dev.jsonl
+data_root: ""
+out_dir: exp/stage1_pinyin_auxchar
+
+epochs: 50
+batch_size: 8
+bucket_size: 40
+epoch_samples: 0
+# Prevent the much larger CN-CVS from erasing CMLR. These are corpus sampling
+# probabilities, not loss weights. Add CNC only after reliable pseudo labels.
+source_weights:
+  cn_cvs: 0.70
+  cmlr: 0.30
+accum_steps: 4
+lr: 5.0e-4
+warmup_steps: 10000
+weight_decay: 0.01
+grad_clip: 5.0
+num_workers: 8
+crop_size: 88
+time_mask: 4
+flip_prob: 0.5
+mean: 0.421
+std: 0.165
+max_frames: 0
+min_frames: 4
+device: auto
+amp: true
+compile: false
+resume: ""
+save_every: 2
+keep_ckpts: 8
+eval_every: 1
+selection_metric: ser
+log_every: 50
+seed: 2026
+
+model:
+  d_model: 512
+  heads: 8
+  ffn: 2048
+  enc_layers: 12
+  sanm_kernel: 11
+  dropout: 0.1
+  frontend: resnet18
+  frontend_width: 64
+  in_channels: 1
+  alpha: 0.1
+  lambda_ctc: 1.0
+  char_dec_layers: 0
+  pinyin_dec_layers: 0
+  label_smoothing: 0.0
+  architecture_version: 2

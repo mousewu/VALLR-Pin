@@ -1,0 +1,21 @@
+# Step-3：Pinyin-Guided LLM Adaptation（论文超参：lr=1e-4, r=8, alpha=32）
+model_path: Qwen/Qwen3-4B-Instruct-2507
+train_jsonl: data/llm/train.jsonl
+val_jsonl: data/llm/val.jsonl
+out_dir: exp/llm_lora
+
+epochs: 2
+batch_size: 2
+accum_steps: 8
+lr: 1.0e-4
+warmup_ratio: 0.03
+max_length: 1024
+
+lora_rank: 8
+lora_alpha: 32
+lora_dropout: 0.05
+target_modules: [q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj]
+
+dtype: bf16
+device: auto
+grad_ckpt: true
