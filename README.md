@@ -212,6 +212,12 @@ pip install -r requirements.txt
 python tests/test_pipeline_units.py          # 单元测试，不需要 GPU/数据
 ```
 
+从原始视频生成嘴部 ROI 还需要安装视频预处理依赖：
+
+```bash
+pip install -r requirements-preprocess.txt
+```
+
 ### 6.0 从 CN-CVS / CMLR 零开始训练 Stage-I
 
 生产训练入口、数据角色、ROI 质量门、DDP/恢复训练和三组公平消融见
@@ -227,6 +233,7 @@ for split in train dev test; do
     --face-model models/face_landmarker.task --workers 8
 done
 python scripts/audit_stage1_data.py data/stage1/{train,dev,test}.roi.jsonl \
+  --max-frames 1000 --max-frames-per-syllable 20 \
   --out data/stage1/audit.json
 torchrun --standalone --nproc_per_node=8 -m vallr_pin.cli train \
   --config configs/stage1_pinyin_only.yaml
@@ -332,7 +339,7 @@ k-gram 锚点、取单调子序列、块内 DP，最后按句统计匹配率，�
 ### 6.3 公开数据集（CNVSRC / CMLR）
 
 ```bash
-# 1) 在 corpora.local.yaml 中按实际发行包填写 CN-CVS、CMLR，并可启用
+# 1) 示例配置已直接支持官方 CN-CVS/CMLR 目录，并可启用
 #    CNVSRC.Dev、CN-CVS2-P1、CN-CVS3 等其他有句级文本的来源。
 cp configs/corpora.example.yaml configs/corpora.local.yaml
 python scripts/build_stage1_manifests.py configs/corpora.local.yaml
@@ -343,6 +350,7 @@ for split in train dev test; do
     --face-model models/face_landmarker.task --workers 8
 done
 python scripts/audit_stage1_data.py data/stage1/{train,dev,test}.roi.jsonl \
+  --max-frames 1000 --max-frames-per-syllable 20 \
   --out data/stage1/audit.json
 
 # 2) 视频和纯文本两阶段解耦训练

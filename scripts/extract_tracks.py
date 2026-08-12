@@ -191,6 +191,8 @@ def main():
                     default="raw_scene")
     ap.add_argument("--keep-subset", action="store_true",
                     help="只存渲染必需的关键点（体积小一个数量级，够用）")
+    ap.add_argument("--delegate", choices=["cpu", "gpu"], default="cpu",
+                    help="MediaPipe delegate；批量预处理默认 CPU，避免无图形环境崩溃")
     args = ap.parse_args()
 
     import cv2
@@ -203,7 +205,10 @@ def main():
     H = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     landmarker = vision.FaceLandmarker.create_from_options(
         vision.FaceLandmarkerOptions(
-            base_options=BaseOptions(model_asset_path=args.model),
+            base_options=BaseOptions(
+                model_asset_path=args.model,
+                delegate=(BaseOptions.Delegate.CPU if args.delegate == "cpu"
+                          else BaseOptions.Delegate.GPU)),
             running_mode=vision.RunningMode.VIDEO, num_faces=args.max_faces))
 
     detections, i, n_total = [], 0, 0

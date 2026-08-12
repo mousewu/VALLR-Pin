@@ -8,6 +8,7 @@ out_dir: exp/stage1_pinyin_auxchar
 
 epochs: 50
 batch_size: 8
+max_frames_per_batch: 2400  # 每卡 padding 后的总帧预算；长句会自动缩小 batch
 bucket_size: 40
 epoch_samples: 0
 # Natural corpus proportions by default. Add explicit source weights only when

@@ -66,6 +66,71 @@ def test_distributed_bucket_sampler_is_deterministic_and_sharded():
     assert 10 <= sampled_sources.count("small") <= 30
 
 
+def test_frame_budget_sampler_shrinks_long_batches_without_dropping_items():
+    lengths = [100, 100, 400, 400]
+    sampler = DistributedBucketBatchSampler(
+        lengths, ["toy"] * 4, batch_size=4, bucket_size=4,
+        shuffle=False, drop_last=True, max_frames_per_batch=500)
+    batches = list(sampler)
+    assert sorted(index for batch in batches for index in batch) == list(range(4))
+    assert all(max(lengths[index] for index in batch) * len(batch) <= 500
+               for batch in batches)
+
+
+def test_official_cn_cvs_release_adapter_carries_landmarks(tmp_path):
+    root = tmp_path / "CN-CVS"
+    speaker = root / "news_part02" / "n004"
+    for folder in ("video", "txt", "landmark", "roi", "audio"):
+        (speaker / folder).mkdir(parents=True, exist_ok=True)
+    stem = "n004_00006_001"
+    (speaker / "video" / f"{stem}.mp4").write_bytes(b"sample")
+    (speaker / "txt" / f"{stem}.txt").write_text(
+        "今天天气很好\njin1 tian1 tian1 qi4 hen3 hao3\n", encoding="utf-8")
+    np.save(speaker / "landmark" / f"{stem}_landmark.npy",
+            np.full((12, 98, 2), .5, dtype=np.float32))
+    (speaker / "roi" / f"{stem}.json").write_text("[]", encoding="utf-8")
+    (speaker / "audio" / f"{stem}.wav").write_bytes(b"sample")
+
+    out = tmp_path / "out"
+    report = build_manifests(BuildConfig(
+        sources=[CorpusSpec(name="cn_cvs", root=str(root),
+                            annotation="**/txt/*.txt", format="cn_cvs",
+                            input_type="face_crop")],
+        out_dir=str(out), dev_speaker_percent=0, test_speaker_percent=0))
+    assert report["accepted"] == 1
+    row = json.loads((out / "train.jsonl").read_text(encoding="utf-8"))
+    assert row["id"] == f"cn_cvs:news_part02/n004/{stem}"
+    assert row["speaker_id"] == "cn_cvs:n004" and row["n_frames"] == 12
+    assert row["landmark_format"] == "wflw98_normalized"
+    assert row["landmark_path"].endswith(f"{stem}_landmark.npy")
+
+
+def test_official_cmlr_release_adapter_uses_relative_ids_for_collisions(tmp_path):
+    root = tmp_path / "CMLR"
+    for speaker, date in (("s1", "20180101"), ("s2", "20190101")):
+        text = root / "text" / speaker / date / "section_1_000.00_001.00.txt"
+        video = root / speaker / date / "section_1_000.00_001.00.mp4"
+        text.parent.mkdir(parents=True, exist_ok=True)
+        video.parent.mkdir(parents=True, exist_ok=True)
+        text.write_text("我们学习\n0 1 我们\n", encoding="utf-8")
+        video.write_bytes(b"sample")
+
+    out = tmp_path / "out"
+    spec = CorpusSpec(
+        name="cmlr", root=str(root), annotation="text/**/*.txt", format="cmlr",
+        input_type="raw_scene", speaker_split_map={"s1": "train", "s2": "dev"})
+    report = build_manifests(BuildConfig(
+        sources=[spec], out_dir=str(out), dev_speaker_percent=0,
+        test_speaker_percent=0))
+    assert report["accepted"] == 2 and not report["rejected"]
+    rows = [json.loads(line) for split in ("train", "dev") for line in
+            (out / f"{split}.jsonl").read_text(encoding="utf-8").splitlines()]
+    assert len({row["id"] for row in rows}) == 2
+    assert {row["id"].split(":", 1)[1] for row in rows} == {
+        "s1/20180101/section_1_000.00_001.00",
+        "s2/20190101/section_1_000.00_001.00"}
+
+
 def test_trainer_checkpoint_resume(tmp_path):
     data = tmp_path / "data"; items = []
     for index, text in enumerate(["今天天气", "明天上班", "我们学习", "大家回家", "天气不错", "继续训练"]):
@@ -81,6 +146,7 @@ def test_trainer_checkpoint_resume(tmp_path):
     out = tmp_path / "exp"
     cfg = TrainConfig(train_manifest=str(train), dev_manifest=str(dev), out_dir=str(out),
                       epochs=1, batch_size=2, accum_steps=1, warmup_steps=2,
+                      max_frames_per_batch=32,
                       num_workers=0, crop_size=32, device="cpu", amp=False,
                       save_every=1, model=model)
     Trainer(cfg).fit()

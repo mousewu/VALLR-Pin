@@ -35,6 +35,7 @@ class TrainConfig:
     out_dir: str = "exp/vallr_pin"
     epochs: int = 50
     batch_size: int = 8               # per process/GPU
+    max_frames_per_batch: int = 0     # padded T × batch; 0 disables the frame budget
     bucket_size: int = 40             # batches per length-sorted mega-bucket
     epoch_samples: int = 0            # 0 = number of training rows
     source_weights: Dict[str, float] = field(default_factory=dict)
@@ -187,7 +188,8 @@ class Trainer:
         sampler = DistributedBucketBatchSampler(
             lengths, sources, self.cfg.batch_size, self.cfg.bucket_size,
             self.cfg.source_weights, self.cfg.epoch_samples,
-            self.rank, self.world_size, True, True, self.cfg.seed)
+            self.rank, self.world_size, True, True, self.cfg.seed,
+            self.cfg.max_frames_per_batch)
         loader = DataLoader(
             dataset, batch_sampler=sampler, num_workers=self.cfg.num_workers,
             collate_fn=collate, pin_memory=self.device.type == "cuda",
@@ -199,6 +201,18 @@ class Trainer:
         dataset = self._dataset(self.cfg.dev_manifest, False)
         # Uneven eval shards are safe because collectives happen only after the loop.
         subset = Subset(dataset, list(range(self.rank, len(dataset), self.world_size)))
+        if self.cfg.max_frames_per_batch:
+            local_lengths = [int(dataset.items[index].get("n_frames", 0))
+                             for index in subset.indices]
+            sampler = DistributedBucketBatchSampler(
+                local_lengths, ["eval"] * len(local_lengths), self.cfg.batch_size,
+                self.cfg.bucket_size, rank=0, world_size=1, shuffle=False,
+                drop_last=False, seed=self.cfg.seed,
+                max_frames_per_batch=self.cfg.max_frames_per_batch)
+            return DataLoader(
+                subset, batch_sampler=sampler, num_workers=self.cfg.num_workers,
+                collate_fn=collate, pin_memory=self.device.type == "cuda",
+                persistent_workers=self.cfg.num_workers > 0)
         return DataLoader(subset, batch_size=self.cfg.batch_size, shuffle=False,
                           num_workers=self.cfg.num_workers, collate_fn=collate,
                           pin_memory=self.device.type == "cuda",

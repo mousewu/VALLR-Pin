@@ -37,12 +37,18 @@ cp configs/corpora.example.yaml configs/corpora.local.yaml
 python scripts/build_stage1_manifests.py configs/corpora.local.yaml
 ```
 
-支持四种标注入口：
+支持六种标注入口：
 
 - `jsonl`：字段名由 `*_field` 指定；
 - `delimited`：TSV/CSV 的列号由 `*_column` 指定；
 - `kaldi`：目录内必须有 `text`、`utt2spk`、`video.scp`；
 - `sidecar`：每个视频对应一个文本文件，可用 `text_prefix: "Text:"`。
+- `cn_cvs`：官方 `<part>/<speaker>/{video,txt,landmark,...}` 发布结构；自动携带
+  `wflw98_normalized` 关键点和对应辅助文件。
+- `cmlr`：官方 `text/sN/date/x.txt` 与 `sN/date/x.mp4` 镜像结构；使用完整相对路径
+  作为 ID，避免不同日期或说话人的同名 `section_*` 相互覆盖。
+
+CMLR 只有少量说话人，建议按实验协议填写 `speaker_split_map`，不要依赖 5% 的哈希划分。
 
 输出记录至少包含：
 
@@ -77,6 +83,8 @@ python scripts/preprocess_stage1_roi.py data/stage1/train.jsonl \
 - CMLR `raw_scene`：最多检测 5 张脸，先做跨帧身份关联，再结合覆盖率、归一化口型运动、
   人脸尺寸和画面位置选择说话轨迹；多脸得分差小于 0.05 的歧义样本默认拒绝；
 - CN-CVS `face_crop`：只定位裁剪画面中的主脸，再根据嘴唇关键点裁成嘴部 ROI；
+- 官方 CN-CVS manifest 含 `(T,98,2)` WFLW landmark 时直接复用，不再运行
+  MediaPipe；关键点帧数与视频帧数不一致时整条拒绝；
 - 两者最终都输出 `25fps × 96×96 × gray`，manifest 改写为
   `input_type: mouth_roi, roi_type: mouth`，训练时再随机裁到 88×88。
 
@@ -94,6 +102,8 @@ ROI 几何无需重新做人脸检测。不要用
 - 固定 25fps，不能对整句稀疏抽 16 帧；
 - Stage-I 默认拒绝 `raw_scene`、`face_crop`、缺少 ROI 元数据以及非 25fps manifest；
 - ROI 检出覆盖率至少 95%；
+- landmark 短缺口逐帧插值但不删除视频帧，连续缺口超过
+  `--max-interpolation-gap` 时整条拒绝；
 - 字幕必须对应完整 clip，不允许只截视频而不截标签；
 - `frames >= labels + adjacent_repeat(labels)`；
 - train/dev/test 无同一说话人，跨库名人需额外去重；
@@ -104,7 +114,8 @@ ROI 几何无需重新做人脸检测。不要用
 ```bash
 python scripts/audit_stage1_data.py \
   data/stage1/train.roi.jsonl data/stage1/dev.roi.jsonl data/stage1/test.roi.jsonl \
-  --pixel-samples 5000 --out data/stage1/audit.json
+  --pixel-samples 5000 --max-frames 1000 --max-frames-per-syllable 20 \
+  --out data/stage1/audit.json
 ```
 
 脚本发现 speaker leakage 或非法 CTC 长度时以非零状态退出。把报告中的
@@ -125,7 +136,9 @@ python -m vallr_pin.cli train --config configs/stage1_multicorpus.yaml \
 
 ### 6.2 多卡全量训练
 
-8 卡时默认有效 batch 为 `8 samples/GPU × 8 GPU × accum 4 = 256`：
+`batch_size` 是每卡样本数上限；`max_frames_per_batch` 还会按 padding 后总帧数动态缩小
+长句 batch。短句情况下，8 卡默认有效 batch 上限为
+`8 samples/GPU × 8 GPU × accum 4 = 256`：
 
 ```bash
 torchrun --standalone --nproc_per_node=8 -m vallr_pin.cli train \

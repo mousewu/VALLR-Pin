@@ -90,7 +90,7 @@ def validate_roi_manifest(items: List[dict], expected_fps: float = 25.0) -> None
             raise ValueError(
                 f"{uid}: Stage-I requires input_type=mouth_roi and roi_type=mouth; "
                 "run scripts/preprocess_stage1_roi.py first")
-        missing = [key for key in ("fps", "roi_height", "roi_width")
+        missing = [key for key in ("fps", "roi_height", "roi_width", "n_frames")
                    if item.get(key) in (None, "")]
         if missing:
             raise ValueError(f"{uid}: ROI manifest is missing metadata: {', '.join(missing)}")
@@ -101,6 +101,8 @@ def validate_roi_manifest(items: List[dict], expected_fps: float = 25.0) -> None
         height, width = int(item["roi_height"]), int(item["roi_width"])
         if height <= 0 or width <= 0 or height != width:
             raise ValueError(f"{uid}: invalid mouth ROI geometry {height}x{width}")
+        if int(item["n_frames"]) <= 0:
+            raise ValueError(f"{uid}: invalid n_frames={item['n_frames']}")
 
 
 @dataclass
@@ -164,6 +166,10 @@ class LipReadingDataset(Dataset):
                 raise ValueError(
                     f"{uid}: ROI array is {height}x{width}, manifest declares "
                     f"{declared[0]}x{declared[1]}")
+            if len(video) != int(it["n_frames"]):
+                raise ValueError(
+                    f"{uid}: ROI array has {len(video)} frames, manifest declares "
+                    f"{int(it['n_frames'])}")
             crop_size = self.transform.crop_size
             if height != width or min(height, width) < crop_size:
                 raise ValueError(

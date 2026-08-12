@@ -24,7 +24,7 @@ class CorpusSpec:
     root: str
     annotation: str
     enabled: bool = True
-    format: str = "jsonl"       # jsonl | delimited | kaldi | sidecar
+    format: str = "jsonl"       # jsonl | delimited | kaldi | sidecar | cn_cvs | cmlr
     media_root: str = ""
     media_glob: str = "**/*"
     media_extensions: List[str] = field(
@@ -46,6 +46,12 @@ class CorpusSpec:
     default_split: str = ""
     speaker_regex: str = ""
     speaker_path_index: Optional[int] = None
+    # Optional explicit speaker split. This is preferable to percentage hashing
+    # for corpora such as CMLR that only contain a small number of speakers.
+    speaker_split_map: Dict[str, str] = field(default_factory=dict)
+    # Base used to derive collision-safe sidecar IDs. Empty means the static
+    # (non-glob) prefix of ``annotation``.
+    sidecar_id_root: str = ""
     text_prefix: str = "Text:"
     supervision: str = "supervised"  # supervised | pseudo
     pseudo_confidence: float = 1.0
@@ -90,13 +96,18 @@ def _records_jsonl(spec: CorpusSpec) -> Iterator[dict]:
         for line in stream:
             if line.strip():
                 row = json.loads(line)
-                yield {"id": row.get(spec.id_field, ""),
+                output = {"id": row.get(spec.id_field, ""),
                        "text": row.get(spec.text_field, ""),
                        "video": row.get(spec.video_field, ""),
                        "speaker_id": row.get(spec.speaker_field, ""),
                        "global_speaker_id": row.get(spec.global_speaker_field, ""),
                        "split": row.get(spec.split_field, spec.default_split),
                        "confidence": row.get("confidence", spec.pseudo_confidence)}
+                for key in ("landmark_path", "landmark_format", "face_box_path",
+                            "audio_path", "n_frames"):
+                    if row.get(key) not in (None, ""):
+                        output[key] = row[key]
+                yield output
 
 
 def _records_delimited(spec: CorpusSpec) -> Iterator[dict]:
@@ -143,6 +154,13 @@ def _records_kaldi(spec: CorpusSpec) -> Iterator[dict]:
 
 def _records_sidecar(spec: CorpusSpec) -> Iterator[dict]:
     pattern = _path(spec.root, spec.annotation)
+    if spec.sidecar_id_root:
+        id_root = Path(_path(spec.root, spec.sidecar_id_root)).resolve()
+    else:
+        wildcard = min((pattern.find(ch) for ch in "*?[" if ch in pattern),
+                       default=len(pattern))
+        static = pattern[:wildcard]
+        id_root = Path(static if static.endswith(os.sep) else os.path.dirname(static)).resolve()
     for name in sorted(glob.glob(pattern, recursive=True)):
         text_path = Path(name)
         text = ""
@@ -151,14 +169,97 @@ def _records_sidecar(spec: CorpusSpec) -> Iterator[dict]:
                 text = line[len(spec.text_prefix):].strip() if spec.text_prefix else line.strip()
                 if text:
                     break
-        yield {"id": text_path.stem, "text": text, "video": "", "speaker_id": "",
+        try:
+            uid = _relative_no_suffix(text_path.resolve(), id_root)
+        except ValueError:
+            uid = text_path.stem
+        yield {"id": uid, "text": text, "video": "", "speaker_id": "",
                "split": spec.default_split, "_sidecar": str(text_path),
+               "confidence": spec.pseudo_confidence}
+
+
+def _first_nonempty_line(path: Path) -> str:
+    for line in path.read_text(encoding="utf-8-sig").splitlines():
+        if line.strip():
+            return line.strip()
+    return ""
+
+
+def _relative_no_suffix(path: Path, root: Path) -> str:
+    return path.relative_to(root).with_suffix("").as_posix()
+
+
+def _records_cn_cvs(spec: CorpusSpec) -> Iterator[dict]:
+    """Read the official CN-CVS speaker-directory release.
+
+    A speaker directory contains parallel ``video/``, ``txt/``,
+    ``landmark/``, ``roi/`` and ``audio/`` directories.  The supplied 98-point
+    landmarks are normalized to the 224x224 face crop and are carried through
+    the raw manifest so ROI preprocessing can avoid a second face detector.
+    """
+    root = Path(spec.root).resolve()
+    pattern = spec.annotation or "**/txt/*.txt"
+    for text_path in sorted(root.glob(pattern)):
+        if not text_path.is_file() or text_path.parent.name != "txt":
+            continue
+        speaker_root = text_path.parent.parent
+        stem = text_path.stem
+        video = speaker_root / "video" / f"{stem}.mp4"
+        landmark_candidates = (
+            speaker_root / "landmark" / f"{stem}_landmark.npy",
+            speaker_root / "landmark" / f"{stem}.npy",
+        )
+        landmark = next((path for path in landmark_candidates if path.exists()), None)
+        face_box = speaker_root / "roi" / f"{stem}.json"
+        audio = speaker_root / "audio" / f"{stem}.wav"
+        uid = (speaker_root.relative_to(root) / stem).as_posix()
+        row = {"id": uid, "text": _first_nonempty_line(text_path),
+               "video": str(video), "speaker_id": speaker_root.name,
+               "split": spec.default_split, "confidence": spec.pseudo_confidence}
+        if landmark is not None:
+            row.update({"landmark_path": str(landmark),
+                        "landmark_format": "wflw98_normalized",
+                        "n_frames": _n_frames(str(landmark))})
+        if face_box.exists():
+            row["face_box_path"] = str(face_box)
+        if audio.exists():
+            row["audio_path"] = str(audio)
+        yield row
+
+
+def _records_cmlr(spec: CorpusSpec) -> Iterator[dict]:
+    """Read the official CMLR mirrored text/video directory release.
+
+    Text ``root/text/sN/date/x.txt`` maps to video
+    ``root/sN/date/x.mp4``.  The complete relative path is the utterance key;
+    basenames are not unique across speakers and dates in the full corpus.
+    """
+    root = Path(spec.root).resolve()
+    text_root = root / "text"
+    pattern = spec.annotation or "text/**/*.txt"
+    for text_path in sorted(root.glob(pattern)):
+        if not text_path.is_file():
+            continue
+        try:
+            relative = text_path.relative_to(text_root)
+        except ValueError:
+            raise ValueError(
+                f"CMLR annotation must be below {text_root}: {text_path}") from None
+        if len(relative.parts) < 3:
+            continue
+        uid = relative.with_suffix("").as_posix()
+        video = root / relative.with_suffix(".mp4")
+        speaker = relative.parts[0]
+        yield {"id": uid, "text": _first_nonempty_line(text_path),
+               "video": str(video), "speaker_id": speaker,
+               "split": spec.speaker_split_map.get(speaker, spec.default_split),
                "confidence": spec.pseudo_confidence}
 
 
 def read_source(spec: CorpusSpec) -> Iterator[dict]:
     readers = {"jsonl": _records_jsonl, "delimited": _records_delimited,
-               "kaldi": _records_kaldi, "sidecar": _records_sidecar}
+               "kaldi": _records_kaldi, "sidecar": _records_sidecar,
+               "cn_cvs": _records_cn_cvs, "cmlr": _records_cmlr}
     if spec.format not in readers:
         raise ValueError(f"unsupported annotation format: {spec.format}")
     yield from readers[spec.format](spec)
@@ -168,15 +269,17 @@ def _media_index(spec: CorpusSpec) -> Dict[str, str]:
     root = Path(_path(spec.root, spec.media_root or ""))
     allowed = {x.lower() for x in spec.media_extensions}
     found: Dict[str, str] = {}
-    collisions = set()
+    by_basename: Dict[str, List[str]] = defaultdict(list)
     for path in root.glob(spec.media_glob):
         if path.is_file() and path.suffix.lower() in allowed:
-            if path.stem in found:
-                collisions.add(path.stem)
-            else:
-                found[path.stem] = str(path)
-    for stem in collisions:
-        found.pop(stem, None)
+            relative = path.relative_to(root).with_suffix("").as_posix()
+            found[relative] = str(path)
+            by_basename[path.stem].append(str(path))
+    # Keep basename lookup only when it is unambiguous. Relative keys are never
+    # discarded, so mirrored corpora do not lose colliding utterances.
+    for stem, paths in by_basename.items():
+        if len(paths) == 1 and stem not in found:
+            found[stem] = paths[0]
     return found
 
 
@@ -198,7 +301,7 @@ def _resolve_media(spec: CorpusSpec, row: dict, index: Dict[str, str]) -> str:
         candidate = os.path.join(media_root, stem)
         if os.path.exists(candidate):
             return candidate
-    return index.get(utt, "")
+    return index.get(utt.replace(os.sep, "/"), "")
 
 
 def _speaker(spec: CorpusSpec, row: dict, media: str) -> str:
@@ -268,7 +371,7 @@ def build_manifests(cfg: BuildConfig) -> dict:
         if spec.supervision == "pseudo" and not cfg.allow_pseudo:
             rejected[f"{spec.name}:pseudo_disabled"] += 1
             continue
-        index = _media_index(spec)
+        index = {} if spec.format in {"cn_cvs", "cmlr"} else _media_index(spec)
         for row in read_source(spec):
             utt = str(row.get("id", "")).strip()
             text = _clean_label(row.get("text", ""))
@@ -295,9 +398,11 @@ def build_manifests(cfg: BuildConfig) -> dict:
                            else f"{spec.name}:{speaker}")
             split = str(row.get("split") or "").lower()
             if split not in {"train", "dev", "test"}:
+                split = str(spec.speaker_split_map.get(speaker, "")).lower()
+            if split not in {"train", "dev", "test"}:
                 split = _split(speaker_key, cfg.seed,
                                cfg.dev_speaker_percent, cfg.test_speaker_percent)
-            frames = _n_frames(media)
+            frames = int(row.get("n_frames", 0) or _n_frames(media))
             roi_geometry = _roi_geometry(media) if spec.input_type == "mouth_roi" else None
             if spec.input_type == "mouth_roi":
                 if roi_geometry is None:
@@ -311,6 +416,14 @@ def build_manifests(cfg: BuildConfig) -> dict:
                 rejected[f"{spec.name}:pinyin_unknown"] += 1; continue
             if frames and frames < max(len(syllables), len(text)) * cfg.min_frames_per_label:
                 rejected[f"{spec.name}:insufficient_frames"] += 1; continue
+            extra_paths = {}
+            for key in ("landmark_path", "face_box_path", "audio_path"):
+                value = str(row.get(key, "")).strip()
+                if value:
+                    resolved = _path(spec.root, value)
+                    extra_paths[key] = (os.path.abspath(resolved) if cfg.absolute_paths
+                                        else os.path.relpath(resolved, cfg.out_dir))
+            landmark_format = str(row.get("landmark_format", "")).strip()
             accepted.append({"id": unique_id, "video": media, "text": text,
                              "speaker_id": speaker_key, "source": spec.name,
                              "split": split, "n_frames": frames,
@@ -323,6 +436,9 @@ def build_manifests(cfg: BuildConfig) -> dict:
                                 "roi_width": roi_geometry[1],
                                 "roi_channels": roi_geometry[2]}
                                if roi_geometry is not None else {}),
+                             **extra_paths,
+                             **({"landmark_format": landmark_format}
+                                if landmark_format else {}),
                              "supervision": spec.supervision,
                              "confidence": confidence})
             speakers_by_split[split].add(speaker_key)

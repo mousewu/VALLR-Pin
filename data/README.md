@@ -44,6 +44,8 @@ Stage-I 不直接读取原始 CMLR/CN-CVS 视频。先在 corpus 配置中将 CM
 `input_type: raw_scene`、CN-CVS 标为 `input_type: face_crop`，构建原始 manifest 后运行
 `scripts/preprocess_stage1_roi.py`。训练配置只应指向 `*.roi.jsonl`；训练器会拒绝没有
 `input_type: mouth_roi`、`roi_type: mouth`、固定帧率和 ROI 尺寸元数据的记录。
+官方 CN-CVS 的 `(T,98,2)` landmark 会直接用于嘴部裁剪；CMLR 的完整
+`sN/日期/文件名` 相对路径作为唯一键，不能退化为 basename。
 
 ## reports/ 里的关键结论
 

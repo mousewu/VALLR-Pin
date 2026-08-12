@@ -7,6 +7,7 @@ out_dir: exp/vallr_pin_cnvsrc
 
 epochs: 75
 batch_size: 8            # 单卡 A100-80G 的经验值；显存不足时配合 accum_steps
+max_frames_per_batch: 2400  # padding 后每卡总帧预算，避免长句显存尖峰
 accum_steps: 4
 lr: 1.0e-3               # Noam 式 warmup + 1/sqrt(step) 衰减
 warmup_steps: 10000

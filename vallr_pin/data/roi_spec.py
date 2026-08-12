@@ -28,6 +28,9 @@ import numpy as np
 LIPS_OUTER = [61, 146, 91, 181, 84, 17, 314, 405, 321, 375, 291,
               409, 270, 269, 267, 0, 37, 39, 40, 185]
 
+# WFLW/CN-CVS 98 点定义：76..87 为外唇，88..95 为内唇。
+WFLW98_LIPS_OUTER = list(range(76, 88))
+
 
 @dataclass
 class ROISpec:
@@ -117,7 +120,7 @@ class FaceTrack:
                    int(d["width"]), int(d["height"]), meta, indices)
 
     def points(self, row: int) -> np.ndarray:
-        """按需恢复原始 MediaPipe 索引空间；只为当前帧分配约 4KB。"""
+        """按需恢复原始索引空间；compact MediaPipe 每帧只分配约 4KB。"""
         if self.point_indices is None:
             return self.landmarks[row]
         n = int(self.meta.get("landmark_count", 478))
@@ -130,6 +133,55 @@ class FaceTrack:
         return self.landmarks.shape[1] * 2 * 2  # K 点 × xy × float16
 
 
+def build_wflw98_track(landmarks: np.ndarray, fps: float, width: int, height: int,
+                       n_total_frames: int = 0, normalized: bool = True,
+                       source: str = "") -> FaceTrack:
+    """Convert CN-CVS/WFLW98 landmarks into the common track cache.
+
+    CN-CVS stores normalized coordinates while :class:`FaceTrack` always uses
+    source-video pixels. Frame count is checked strictly because silently
+    stretching landmarks over a different video length corrupts lip timing.
+    """
+    points = np.asarray(landmarks, dtype=np.float32)
+    if points.ndim != 3 or points.shape[1:] != (98, 2):
+        raise ValueError(f"WFLW98 landmarks must have shape (T,98,2), got {points.shape}")
+    if not len(points):
+        raise ValueError("WFLW98 landmarks are empty")
+    if not np.isfinite(points).all():
+        raise ValueError("WFLW98 landmarks contain NaN/Inf")
+    if width <= 0 or height <= 0 or fps <= 0:
+        raise ValueError(f"invalid video metadata: {width}x{height} at {fps:g}fps")
+    if n_total_frames > 0 and len(points) != int(n_total_frames):
+        raise ValueError(
+            f"landmark/video frame mismatch: {len(points)} != {int(n_total_frames)}")
+    if normalized:
+        # Permit small extrapolation outside the crop but catch an accidental
+        # pixel-coordinate file marked as normalized.
+        if float(np.nanmax(np.abs(points))) > 4.0:
+            raise ValueError("WFLW98 file is not normalized as declared")
+        points = points.copy()
+        points[..., 0] *= float(width)
+        points[..., 1] *= float(height)
+
+    left_eye = points[:, 60:68].mean(axis=1)
+    right_eye = points[:, 68:76].mean(axis=1)
+    eye_span = np.maximum(np.linalg.norm(left_eye - right_eye, axis=1), 1.0)
+    nose_x = points[:, 54, 0]
+    eye_mid_x = (left_eye[:, 0] + right_eye[:, 0]) / 2.0
+    yaw = np.abs(nose_x - eye_mid_x) / eye_span
+    lip_width = np.linalg.norm(points[:, 76] - points[:, 82], axis=1)
+    total = int(n_total_frames or len(points))
+    return FaceTrack(
+        frames=np.arange(len(points), dtype=np.int32), landmarks=points,
+        fps=float(fps), width=int(width), height=int(height),
+        meta={"n_total_frames": total, "landmark_count": 98,
+              "landmark_schema": "wflw98", "landmark_source": source,
+              "input_type": "face_crop", "selection_strategy": "official_landmarks",
+              "selected_track_id": 0, "selection_margin": 1.0,
+              "face_track_count": 1, "median_lip_width_px": float(np.median(lip_width)),
+              "median_yaw_proxy": float(np.median(yaw))})
+
+
 def anchor_box(pts: np.ndarray, spec: ROISpec) -> Tuple[float, float, float]:
     """由关键点算出裁剪中心与参考半径 (cx, cy, r)。
 
@@ -138,7 +190,7 @@ def anchor_box(pts: np.ndarray, spec: ROISpec) -> Tuple[float, float, float]:
     半径暴增到半个画面 —— 渲染出的图整帧缩小，模型直接失效（本仓库踩过这个坑）。
     """
     if spec.anchor == "lips":
-        ref = pts[LIPS_OUTER]
+        ref = pts[WFLW98_LIPS_OUTER] if len(pts) == 98 else pts[LIPS_OUTER]
     else:                                            # 整脸
         ref = pts
     x0, y0 = float(np.nanmin(ref[:, 0])), float(np.nanmin(ref[:, 1]))
@@ -166,9 +218,14 @@ _MEAN_FACE_5_NORM = np.array([
 
 
 def alignment_points(pts: np.ndarray) -> np.ndarray:
-    """从 MediaPipe 关键点得到五点相似变换锚点，返回 (5,2)。"""
+    """从 MediaPipe 或 WFLW98 关键点得到五点相似变换锚点，返回 (5,2)。"""
+    if len(pts) == 98:
+        groups = (tuple(range(60, 68)), tuple(range(68, 76)),
+                  (54,), (76,), (82,))
+    else:
+        groups = _ALIGN_GROUPS
     out = []
-    for group in _ALIGN_GROUPS:
+    for group in groups:
         p = pts[list(group)]
         if not np.isfinite(p).all():
             raise ValueError(f"仿射对齐缺少关键点 {group}；轨迹缓存需重新抽取")

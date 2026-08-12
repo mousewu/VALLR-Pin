@@ -4,6 +4,7 @@ dev_manifest: data/stage1/dev.roi.jsonl
 out_dir: exp/stage1_pinyin_only
 epochs: 50
 batch_size: 8
+max_frames_per_batch: 2400
 bucket_size: 40
 epoch_samples: 0
 # Empty means sample every source present in the manifest at its natural rate.

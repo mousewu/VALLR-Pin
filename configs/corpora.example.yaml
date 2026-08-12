@@ -12,37 +12,27 @@ min_pseudo_confidence: 0.95
 require_speaker: true
 
 sources:
-  # CN-CVS releases may ship JSONL, TSV, or Kaldi-style metadata. Select the
-  # matching adapter; do not assume this example's filenames are universal.
+  # Official release layout:
+  # <part>/<speaker>/{video,txt,landmark,roi,audio}/<utterance>.*
   - name: cn_cvs
     root: /DATA/CN-CVS
-    annotation: metadata/train.tsv
-    format: delimited
-    delimiter: "\t"
-    id_column: 0
-    text_column: 1
-    speaker_column: 2
-    video_column: 3       # set -1 when media is resolved by utterance id
-    default_split: train
-    # CN-CVS ships face-cropped clips. They are not yet mouth ROIs.
+    annotation: "**/txt/*.txt"
+    format: cn_cvs
+    default_split: ""       # empty = deterministic speaker split
     input_type: face_crop
-    media_root: videos
-    media_glob: "**/*"       # media_extensions 会过滤 mp4/avi/mov/mkv
     supervision: supervised
 
+  # Official mirrored layout: text/sN/date/x.txt <-> sN/date/x.mp4.
+  # Basenames are not globally unique, so use the dedicated cmlr adapter.
   - name: cmlr
     root: /DATA/CMLR
-    annotation: metadata.jsonl
-    format: jsonl
-    id_field: id
-    text_field: text
-    video_field: video
-    speaker_field: speaker_id
-    split_field: split
-    # CMLR clips retain the upper body/background and require scene-level face tracking.
+    annotation: "text/**/*.txt"
+    format: cmlr
+    default_split: ""
+    # With only 11 speakers, an explicit published/experimental protocol is
+    # preferable, for example: {s1: train, s9: dev, s11: test}.
+    speaker_split_map: {}
     input_type: raw_scene
-    media_root: videos
-    media_glob: "**/*"
     supervision: supervised
 
   # CN-Celeb-AV/CNC-AV is not a supervised VSR source unless sentence-level

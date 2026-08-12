@@ -22,7 +22,8 @@ class DistributedBucketBatchSampler(Sampler[List[int]]):
     def __init__(self, lengths: Sequence[int], sources: Sequence[str], batch_size: int,
                  bucket_size: int = 40, source_weights: Dict[str, float] | None = None,
                  epoch_samples: int = 0, rank: int = 0, world_size: int = 1,
-                 shuffle: bool = True, drop_last: bool = False, seed: int = 0):
+                 shuffle: bool = True, drop_last: bool = False, seed: int = 0,
+                 max_frames_per_batch: int = 0):
         if len(lengths) != len(sources):
             raise ValueError("lengths and sources must have equal size")
         if batch_size < 1 or world_size < 1:
@@ -34,10 +35,17 @@ class DistributedBucketBatchSampler(Sampler[List[int]]):
         self.epoch_samples = int(epoch_samples or len(lengths))
         self.rank, self.world_size = rank, world_size
         self.shuffle, self.drop_last, self.seed = shuffle, drop_last, seed
+        self.max_frames_per_batch = max(int(max_frames_per_batch), 0)
         self.epoch = 0
         unknown = set(self.source_weights) - set(self.sources)
         if unknown:
             raise ValueError(f"source_weights refer to absent sources: {sorted(unknown)}")
+        if self.max_frames_per_batch and self.lengths:
+            longest = max(self.lengths)
+            if longest > self.max_frames_per_batch:
+                raise ValueError(
+                    f"longest sample has {longest} frames but max_frames_per_batch="
+                    f"{self.max_frames_per_batch}; filter/segment it or raise the budget")
 
     def set_epoch(self, epoch: int) -> None:
         self.epoch = int(epoch)
@@ -64,9 +72,26 @@ class DistributedBucketBatchSampler(Sampler[List[int]]):
         for start in range(0, len(indices), mega):
             bucket = indices[start:start + mega]
             bucket.sort(key=lambda i: self.lengths[i])
-            batches.extend(bucket[i:i + self.batch_size]
-                           for i in range(0, len(bucket), self.batch_size))
-        if self.drop_last:
+            if not self.max_frames_per_batch:
+                batches.extend(bucket[i:i + self.batch_size]
+                               for i in range(0, len(bucket), self.batch_size))
+                continue
+            current: List[int] = []
+            current_max = 0
+            for index in bucket:
+                next_max = max(current_max, self.lengths[index])
+                padded_frames = next_max * (len(current) + 1)
+                if current and (len(current) >= self.batch_size or
+                                padded_frames > self.max_frames_per_batch):
+                    batches.append(current)
+                    current, current_max = [], 0
+                current.append(index)
+                current_max = max(current_max, self.lengths[index])
+            if current:
+                batches.append(current)
+        # With a frame budget, short batches are intentional rather than an
+        # incomplete tail, so they must not be discarded.
+        if self.drop_last and not self.max_frames_per_batch:
             batches = [b for b in batches if len(b) == self.batch_size]
         if self.shuffle:
             random.Random(self.seed + self.epoch + 17).shuffle(batches)
@@ -78,6 +103,8 @@ class DistributedBucketBatchSampler(Sampler[List[int]]):
         yield from self._global_batches()[self.rank::self.world_size]
 
     def __len__(self) -> int:
+        if self.max_frames_per_batch:
+            return len(self._global_batches()[self.rank::self.world_size])
         n = self.epoch_samples
         global_batches = n // self.batch_size if self.drop_last else math.ceil(n / self.batch_size)
         return global_batches // self.world_size

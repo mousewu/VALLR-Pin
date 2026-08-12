@@ -9,9 +9,7 @@ transformers>=4.44
 peft>=0.11
 accelerate>=0.30
 
-# 可选
-# opencv-python>=4.8   # 读取视频、渲染 ROI96
-# mediapipe>=0.10      # 从原始视频抽取 Face Landmarker 轨迹
+# 数据预处理依赖见 requirements-preprocess.txt
 # ms-swift>=3.0        # 论文使用的微调框架（本仓库自带等价实现）
 # deepspeed>=0.14      # 多卡 LoRA 训练
 # swanlab>=0.7         # 可选实验跟踪；配置 swanlab.enabled=true 时需要

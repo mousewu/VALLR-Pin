@@ -1,0 +1,7 @@
+-r requirements.txt
+
+# Required for raw_scene/face_crop -> mouth_roi preprocessing.
+# MediaPipe depends on the same contrib wheel; using one OpenCV distribution
+# avoids cv2 files being overwritten by both opencv-python and contrib.
+opencv-contrib-python>=4.8
+mediapipe>=0.10

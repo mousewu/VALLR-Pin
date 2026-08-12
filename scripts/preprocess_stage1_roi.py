@@ -25,7 +25,8 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from scripts.render_variant import render  # noqa: E402
 from vallr_pin.data.dataset import read_manifest  # noqa: E402
-from vallr_pin.data.roi_spec import FaceTrack, resolve_spec  # noqa: E402
+from vallr_pin.data.roi_spec import (FaceTrack, build_wflw98_track,  # noqa: E402
+                                     resolve_spec)
 
 INPUT_TYPES = {"raw_scene", "face_crop", "mouth_roi"}
 
@@ -46,6 +47,49 @@ def _resolve_media(item: dict, data_root: str) -> str:
     if value.startswith("wds://") or os.path.isabs(value):
         return value
     return os.path.join(data_root, value)
+
+
+def _resolve_aux_path(value: str, data_root: str) -> str:
+    if not value or os.path.isabs(value):
+        return value
+    return os.path.join(data_root, value)
+
+
+def _video_info(path: str) -> tuple[float, int, int, int]:
+    import cv2
+
+    cap = cv2.VideoCapture(path)
+    if not cap.isOpened():
+        raise ValueError(f"cannot open video: {path}")
+    fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+    frames = int(round(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0))
+    cap.release()
+    if fps <= 0 or width <= 0 or height <= 0 or frames <= 0:
+        raise ValueError(
+            f"invalid video metadata: {width}x{height}, fps={fps:g}, frames={frames}")
+    return fps, width, height, frames
+
+
+def _file_fingerprint(path: str) -> str:
+    stat = os.stat(path)
+    return f"{os.path.abspath(path)}:{stat.st_size}:{stat.st_mtime_ns}"
+
+
+def _write_official_track(landmark_path: str, landmark_format: str,
+                          video: str, track_path: Path) -> FaceTrack:
+    if landmark_format not in {"wflw98", "wflw98_normalized"}:
+        raise ValueError(f"unsupported landmark_format: {landmark_format}")
+    fps, width, height, video_frames = _video_info(video)
+    landmarks = np.load(landmark_path, mmap_mode="r")
+    track = build_wflw98_track(
+        landmarks, fps, width, height, video_frames,
+        normalized=landmark_format.endswith("_normalized"),
+        source=os.path.abspath(landmark_path))
+    track.meta["landmark_fingerprint"] = _file_fingerprint(landmark_path)
+    track.save(str(track_path))
+    return track
 
 
 def _shape_info(array: np.ndarray) -> tuple[int, int, int, int]:
@@ -87,7 +131,8 @@ def _mouth_roi_metadata(item: dict, path: str, target_fps: float,
     return output, info
 
 
-def _cached_render_info(roi: Path, target_fps: float, expected_size: int) -> dict | None:
+def _cached_render_info(roi: Path, target_fps: float, expected_size: int,
+                        max_interpolation_gap: int) -> dict | None:
     sidecar = Path(str(roi).replace(".npy", ".spec.json"))
     if not roi.exists() or not sidecar.exists():
         return None
@@ -96,6 +141,10 @@ def _cached_render_info(roi: Path, target_fps: float, expected_size: int) -> dic
         array = np.load(roi, mmap_mode="r")
         _, height, width, channels = _shape_info(array)
         actual_fps = float(info.get("target_fps", info.get("spec", {}).get("fps", 0)) or 0)
+        if int(info.get("render_version", 0)) < 2:
+            return None
+        if int(info.get("max_interpolation_gap", -1)) != int(max_interpolation_gap):
+            return None
         if (height, width, channels) != (expected_size, expected_size, 1):
             return None
         if abs(actual_fps - target_fps) > 0.05:
@@ -110,7 +159,8 @@ def process(item: dict, output_root: str, model: str, min_coverage: float,
             keep_tracks: bool, target_fps: float, raw_scene_max_faces: int,
             raw_scene_selection: str, raw_scene_min_margin: float,
             face_crop_max_faces: int, min_lip_width_px: float,
-            max_yaw_proxy: float, data_root: str) -> tuple[dict | None, dict]:
+            max_yaw_proxy: float, data_root: str,
+            max_interpolation_gap: int = 5) -> tuple[dict | None, dict]:
     source = str(item.get("source", "unknown"))
     input_type = str(item.get("input_type", ""))
     key = _key(item)
@@ -130,7 +180,17 @@ def process(item: dict, output_root: str, model: str, min_coverage: float,
         max_faces = raw_scene_max_faces if input_type == "raw_scene" else face_crop_max_faces
         min_margin = raw_scene_min_margin if input_type == "raw_scene" else 0.0
         manual_track = int(item.get("face_track_id", -1))
-        track_variant = f"{input_type}-{selection}-f{max_faces}-t{manual_track}"
+        landmark_path = _resolve_aux_path(str(item.get("landmark_path", "")), data_root)
+        landmark_format = str(item.get("landmark_format", ""))
+        if landmark_path and not landmark_format:
+            raise ValueError("landmark_path requires landmark_format")
+        use_official_landmarks = bool(
+            input_type == "face_crop" and landmark_path and landmark_format)
+        if landmark_path and not os.path.exists(landmark_path):
+            raise FileNotFoundError(landmark_path)
+        landmark_variant = landmark_format or "detected"
+        track_variant = (f"{input_type}-{landmark_variant}-{selection}-"
+                         f"f{max_faces}-t{manual_track}")
         base = Path(output_root) / _component(source)
         # Selection parameters are part of the derived-data identity.  A manual
         # face-track correction must never reuse an ROI rendered from an older
@@ -140,24 +200,37 @@ def process(item: dict, output_root: str, model: str, min_coverage: float,
         roi.parent.mkdir(parents=True, exist_ok=True)
         track.parent.mkdir(parents=True, exist_ok=True)
 
-        command = [sys.executable, str(Path(__file__).with_name("extract_tracks.py")),
-                   video, "--model", model, "--out", str(track), "--keep-subset",
-                   "--input-type", input_type, "--selection", selection,
-                   "--max-faces", str(max_faces), "--min-selection-margin",
-                   str(min_margin), "--min-lip-width-px", str(min_lip_width_px),
-                   "--max-yaw-proxy", str(max_yaw_proxy)]
-        if manual_track >= 0:
-            command.extend(["--track-id", str(manual_track)])
         needs_extract = not track.exists()
         if not needs_extract:
             try:
                 old_meta = FaceTrack.load(str(track)).meta
                 needs_extract = not {"median_lip_width_px", "median_yaw_proxy"} <= old_meta.keys()
+                if use_official_landmarks:
+                    needs_extract = needs_extract or (
+                        old_meta.get("landmark_fingerprint") !=
+                        _file_fingerprint(landmark_path))
             except (OSError, ValueError, KeyError):
                 needs_extract = True
+        track_rebuilt = False
         if needs_extract:
-            subprocess.run(command, check=True, stdout=subprocess.DEVNULL,
-                           stderr=subprocess.PIPE, text=True)
+            if use_official_landmarks:
+                _write_official_track(landmark_path, landmark_format, video, track)
+            else:
+                if not model:
+                    raise ValueError(
+                        "face-model is required when official landmarks are unavailable")
+                command = [
+                    sys.executable, str(Path(__file__).with_name("extract_tracks.py")),
+                    video, "--model", model, "--out", str(track), "--keep-subset",
+                    "--input-type", input_type, "--selection", selection,
+                    "--max-faces", str(max_faces), "--min-selection-margin",
+                    str(min_margin), "--min-lip-width-px", str(min_lip_width_px),
+                    "--max-yaw-proxy", str(max_yaw_proxy)]
+                if manual_track >= 0:
+                    command.extend(["--track-id", str(manual_track)])
+                subprocess.run(command, check=True, stdout=subprocess.DEVNULL,
+                               stderr=subprocess.PIPE, text=True)
+            track_rebuilt = True
 
         cached_track = FaceTrack.load(str(track))
         lip_width = float(cached_track.meta.get("median_lip_width_px", 0.0))
@@ -170,9 +243,12 @@ def process(item: dict, output_root: str, model: str, min_coverage: float,
                 f"yaw_proxy {yaw_proxy:.3f} > required {max_yaw_proxy:.3f}")
 
         spec = replace(resolve_spec("vallr_pin"), fps=int(round(target_fps)))
-        info = _cached_render_info(roi, target_fps, spec.size)
+        info = (None if track_rebuilt else
+                _cached_render_info(roi, target_fps, spec.size, max_interpolation_gap))
         if info is None:
-            info = render(video, str(track), spec, str(roi), min_coverage=min_coverage)
+            info = render(video, str(track), spec, str(roi),
+                          min_coverage=min_coverage,
+                          max_interpolation_gap=max_interpolation_gap)
 
         shape = info["shape"]
         track_meta = info.get("track_meta", {})
@@ -195,6 +271,14 @@ def process(item: dict, output_root: str, model: str, min_coverage: float,
             track.unlink()
         return output, {"id": item["id"], "source": source,
                         "input_type": input_type, "status": "ok", **info}
+    except subprocess.CalledProcessError as exc:
+        detail = (exc.stderr or exc.stdout or "").strip()
+        message = f"track extraction failed (exit={exc.returncode})"
+        if detail:
+            message += f": {detail[-4000:]}"
+        return None, {"id": item.get("id", ""), "source": source,
+                      "input_type": input_type or "missing", "status": "rejected",
+                      "error": message}
     except Exception as exc:
         return None, {"id": item.get("id", ""), "source": source,
                       "input_type": input_type or "missing", "status": "rejected",
@@ -206,7 +290,8 @@ def main() -> None:
     ap.add_argument("manifest")
     ap.add_argument("--out-manifest", required=True)
     ap.add_argument("--out-root", required=True)
-    ap.add_argument("--face-model", required=True)
+    ap.add_argument("--face-model", default="",
+                    help="无官方 landmark 的数据必需；纯 CN-CVS 官方包可省略")
     ap.add_argument("--data-root", default="")
     ap.add_argument("--workers", type=int, default=1)
     ap.add_argument("--min-coverage", type=float, default=.95)
@@ -219,6 +304,8 @@ def main() -> None:
     ap.add_argument("--min-lip-width-px", type=float, default=12.0)
     ap.add_argument("--max-yaw-proxy", type=float, default=0.0,
                     help="0 表示只记录侧脸指标，不自动拒绝")
+    ap.add_argument("--max-interpolation-gap", type=int, default=5,
+                    help="允许插值的最长连续关键点缺口；更长则拒绝样本")
     ap.add_argument("--discard-tracks", action="store_true")
     args = ap.parse_args()
     if abs(args.target_fps - round(args.target_fps)) > 1e-6:
@@ -231,7 +318,8 @@ def main() -> None:
             not args.discard_tracks, args.target_fps, args.raw_scene_max_faces,
             args.raw_scene_selection, args.raw_scene_min_margin,
             args.face_crop_max_faces, args.min_lip_width_px,
-            args.max_yaw_proxy, args.data_root) for item in items]
+            args.max_yaw_proxy, args.data_root,
+            args.max_interpolation_gap) for item in items]
         for index, future in enumerate(as_completed(futures), 1):
             results.append(future.result())
             if index % 100 == 0:

@@ -16,11 +16,12 @@ import sys
 import tempfile
 
 import numpy as np
+import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from vallr_pin.data.roi_spec import (LIPS_OUTER, PRESETS, ROISpec, FaceTrack,  # noqa: E402
-                                     alignment_points, anchor_box,
+                                     alignment_points, anchor_box, build_wflw98_track,
                                      mean_face_template, resolve_spec)
 
 
@@ -139,6 +140,39 @@ def test_compact_track_lazy_expansion_roundtrip():
     assert np.allclose(restored[KEY_POINTS],full[KEY_POINTS],atol=.5)  # float16 cache
     assert np.isnan(restored[2]).all() if 2 not in KEY_POINTS else True
     assert loaded.nbytes_per_frame < 300
+
+
+def test_cn_cvs_wflw98_track_converts_normalized_coordinates():
+    points = np.full((2, 98, 2), .5, dtype=np.float32)
+    points[:, 60:68] = [.35, .35]
+    points[:, 68:76] = [.65, .35]
+    points[:, 54] = [.50, .52]
+    for index, angle in zip(range(76, 88), np.linspace(0, 2 * np.pi, 12, endpoint=False)):
+        points[:, index] = [.5 + .12 * np.cos(angle), .68 + .06 * np.sin(angle)]
+    for index, angle in zip(range(88, 96), np.linspace(0, 2 * np.pi, 8, endpoint=False)):
+        points[:, index] = [.5 + .06 * np.cos(angle), .68 + .03 * np.sin(angle)]
+    track = build_wflw98_track(points, 25.0, 224, 224, n_total_frames=2,
+                               normalized=True, source="official.npy")
+    assert track.landmarks.shape == (2, 98, 2)
+    assert np.allclose(track.landmarks[:, 54], [112, 116.48], atol=1e-3)
+    assert track.meta["landmark_schema"] == "wflw98"
+    cx, cy, radius = anchor_box(track.points(0), resolve_spec("vallr_pin"))
+    assert abs(cx - 112) < 1 and abs(cy - 152.32) < 1 and radius > 20
+
+    with pytest.raises(ValueError, match="frame mismatch"):
+        build_wflw98_track(points, 25.0, 224, 224, n_total_frames=3)
+
+
+def test_landmark_gaps_are_interpolated_without_skipping_frames():
+    from scripts.render_variant import landmarks_at
+
+    track = FaceTrack(np.array([0, 2]),
+                      np.array([[[0.0, 0.0]], [[2.0, 2.0]]]),
+                      25.0, 10, 10)
+    points, interpolated = landmarks_at(track, 1, max_interpolation_gap=1)
+    assert interpolated and np.allclose(points, [[1.0, 1.0]])
+    with pytest.raises(ValueError, match="trailing landmark gap"):
+        landmarks_at(track, 4, max_interpolation_gap=1)
 
 
 def test_presets_are_self_consistent():

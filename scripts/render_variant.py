@@ -43,8 +43,57 @@ def maybe_resample(video: str, target_fps: int, src_fps: float, tmpdir: str) -> 
     return out
 
 
+def landmarks_at(track: FaceTrack, frame_index: int,
+                 max_interpolation_gap: int = 5) -> tuple[np.ndarray, bool]:
+    """Return landmarks for one source frame without changing sequence length.
+
+    Missing detections inside a short gap are linearly interpolated; short
+    leading/trailing gaps use the nearest observation. A longer gap rejects the
+    utterance instead of silently deleting frames and compressing time.
+    """
+    frames = np.asarray(track.frames, dtype=np.int64)
+    if frames.ndim != 1 or not len(frames):
+        raise ValueError("face track has no frames")
+    if np.any(np.diff(frames) <= 0):
+        raise ValueError("face track frame numbers must be strictly increasing")
+    pos = int(np.searchsorted(frames, frame_index))
+    if pos < len(frames) and int(frames[pos]) == frame_index:
+        points = track.points(pos)
+        if np.isnan(points).all():
+            raise ValueError(f"frame {frame_index} has no finite landmarks")
+        return points, False
+
+    max_gap = max(int(max_interpolation_gap), 0)
+    left = pos - 1
+    right = pos
+    if left < 0:
+        distance = int(frames[right]) - frame_index
+        if distance > max_gap:
+            raise ValueError(
+                f"leading landmark gap {distance} exceeds {max_gap} frames")
+        return track.points(right), True
+    if right >= len(frames):
+        distance = frame_index - int(frames[left])
+        if distance > max_gap:
+            raise ValueError(
+                f"trailing landmark gap {distance} exceeds {max_gap} frames")
+        return track.points(left), True
+
+    missing_run = int(frames[right] - frames[left] - 1)
+    if missing_run > max_gap:
+        raise ValueError(
+            f"internal landmark gap {missing_run} exceeds {max_gap} frames")
+    denominator = float(frames[right] - frames[left])
+    alpha = (frame_index - int(frames[left])) / denominator
+    points = (1.0 - alpha) * track.points(left) + alpha * track.points(right)
+    if np.isnan(points).all():
+        raise ValueError(f"cannot interpolate landmarks at frame {frame_index}")
+    return points, True
+
+
 def render(video: str, track_path: str, spec, out_path: str,
-           tmpdir: str = "", min_coverage: float = 0.0) -> dict:
+           tmpdir: str = "", min_coverage: float = 0.0,
+           max_interpolation_gap: int = 5) -> dict:
     import cv2
 
     track = FaceTrack.load(track_path)
@@ -59,50 +108,44 @@ def render(video: str, track_path: str, spec, out_path: str,
     else:
         ratio = 1.0
 
-    lut = {int(f): i for i, f in enumerate(track.frames)}
     cap = cv2.VideoCapture(src)
     out_frames, missing, i = [], 0, 0
-    while True:
-        ok, fr = cap.read()
-        if not ok:
-            break
-        src_idx = int(round(i / ratio)) if resampled else i
-        j = lut.get(src_idx)
-        if j is None:                       # 该帧没检出人脸，就近取最相邻的一帧
-            cand = [k for k in (src_idx - 1, src_idx + 1, src_idx - 2, src_idx + 2)
-                    if k in lut]
-            if not cand:
-                missing += 1
-                i += 1
-                continue
-            j = lut[cand[0]]
-        pts = track.points(j)
-        if np.isnan(pts).all():
-            missing += 1
+    try:
+        while True:
+            ok, fr = cap.read()
+            if not ok:
+                break
+            src_idx = int(round(i / ratio)) if resampled else i
+            pts, interpolated = landmarks_at(track, src_idx, max_interpolation_gap)
+            missing += int(interpolated)
+            # 不要在这里填补 NaN：缓存可能只保留了必要关键点，
+            # anchor_box 用 nan-aware 统计量处理，填 0 会把人脸框拉到画面原点
+            out_frames.append(render_frame(fr, pts, spec))
             i += 1
-            continue
-        # 不要在这里填补 NaN：缓存可能只保留了必要关键点，
-        # anchor_box 用 nan-aware 统计量处理，填 0 会把人脸框拉到画面原点
-        out_frames.append(render_frame(fr, pts, spec))
-        i += 1
-    cap.release()
+    finally:
+        cap.release()
 
     if not out_frames:
         raise SystemExit("没有可渲染的帧")
-    coverage = len(out_frames) / max(i, 1)
+    # Every decoded frame is represented in the output. Coverage describes how
+    # many frames had an observed (rather than interpolated) landmark.
+    coverage = (i - missing) / max(i, 1)
     if coverage < min_coverage:
         raise ValueError(f"face coverage {coverage:.3f} < required {min_coverage:.3f}")
     arr = np.stack(out_frames)
     os.makedirs(os.path.dirname(os.path.abspath(out_path)) or ".", exist_ok=True)
     np.save(out_path, arr)
     info = {"out": out_path, "shape": list(arr.shape), "dtype": str(arr.dtype),
+            "render_version": 2, "temporal_policy": "preserve_all_frames",
             "spec": spec.to_dict(), "resampled": resampled,
             "src_fps": track.fps, "target_fps": float(spec.fps or track.fps),
-            "missing_frames": missing, "coverage": coverage,
+            "missing_frames": missing, "interpolated_frames": missing,
+            "max_interpolation_gap": int(max_interpolation_gap), "coverage": coverage,
             "track_meta": {key: track.meta[key] for key in
                            ("input_type", "selection_strategy", "selected_track_id",
                             "selection_margin", "face_track_count",
-                            "median_lip_width_px", "median_yaw_proxy")
+                            "median_lip_width_px", "median_yaw_proxy",
+                            "landmark_schema", "landmark_source")
                            if key in track.meta},
             "mb": round(arr.nbytes / 1e6, 1)}
     with open(out_path.replace(".npy", ".spec.json"), "w", encoding="utf-8") as f:
@@ -118,6 +161,8 @@ def main():
     ap.add_argument("--out", default="")
     ap.add_argument("--set", nargs="*", default=[], help="覆盖预设字段，如 size=128")
     ap.add_argument("--min-coverage", type=float, default=0.0)
+    ap.add_argument("--max-interpolation-gap", type=int, default=5,
+                    help="允许插值的最长连续关键点缺口；更长则拒绝样本")
     ap.add_argument("--list", action="store_true", help="列出所有预设规格")
     args = ap.parse_args()
 
@@ -135,7 +180,9 @@ def main():
         over[k] = type(cur)(v) if cur is not None and not isinstance(cur, tuple) else v
     if over:
         spec = replace(spec, **over)
-    info = render(args.video, args.track, spec, args.out, min_coverage=args.min_coverage)
+    info = render(args.video, args.track, spec, args.out,
+                  min_coverage=args.min_coverage,
+                  max_interpolation_gap=args.max_interpolation_gap)
     print(json.dumps(info, ensure_ascii=False, indent=2))
 
 
