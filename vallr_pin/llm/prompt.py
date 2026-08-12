@@ -1,12 +1,8 @@
-"""Stage-II 提示词构造 (对应论文 Eq.15 的 P(Y | P̂, {Ŷ(k)}))。
+"""Stage-II prompts for decoupled Pinyin-to-text reconstruction.
 
-提示词里三类信息缺一不可：
-
-1. **拼音序列 P̂** —— 唇动能可靠恢复的那一层信息，是纠错的硬约束；
-2. **N-best 候选 {Ŷ(k)}** —— 提供词法/搭配先验，也隐含了声学(视觉)后验排序；
-3. **格式与长度约束** —— 强制"只输出一句中文、字数≈音节数"，
-   这是抑制 LLM 自由发挥 (改写、补全、解释) 的关键；论文中零样本 LLM 反而
-   使 CER 变差 (37.23 → 37.86)，主要就是这类过度生成造成的。
+The primary interface is noisy Pinyin only, allowing the LLM to be trained on
+arbitrarily large text corpora without any Stage-I checkpoint.  Character
+N-best hypotheses remain an optional calibration/inference extension.
 """
 
 from __future__ import annotations
@@ -14,7 +10,15 @@ from __future__ import annotations
 import re
 from typing import Dict, List, Sequence
 
-SYSTEM_PROMPT = (
+PINYIN_SYSTEM_PROMPT = (
+    "你是中文视觉语音识别系统的拼音解码器。"
+    "输入是一条可能存在替换、删除、插入、乱序或遮挡错误的无声调拼音序列。"
+    "请结合拼音约束和汉语语言常识，恢复最可能的原始中文句子。"
+    "要求：只输出这一句中文，不要输出拼音、解释或候选列表；"
+    "输出长度应与拼音音节数尽量一致，不要扩写，不要改写句意。"
+)
+
+CALIBRATION_SYSTEM_PROMPT = (
     "你是中文唇语识别（VSR）系统的后处理专家。"
     "输入包含：一条由唇动模型识别出的无声调拼音序列，以及若干条候选中文转写（按置信度排序）。"
     "拼音序列和候选文本都可能有错。"
@@ -23,19 +27,27 @@ SYSTEM_PROMPT = (
     "输出字数应与拼音音节数尽量一致；不要扩写、不要改写句意。"
 )
 
+# Backwards-compatible public name for callers that imported it directly.
+SYSTEM_PROMPT = CALIBRATION_SYSTEM_PROMPT
 
-def build_user_prompt(pinyin: Sequence[str], nbest: Sequence[str]) -> str:
+
+def build_user_prompt(pinyin: Sequence[str], nbest: Sequence[str] | None = None) -> str:
     py = " ".join(pinyin) if pinyin else "(空)"
-    lines = [f"拼音序列（{len(pinyin)} 个音节）：{py}", "候选转写："]
-    for i, cand in enumerate(nbest, 1):
-        lines.append(f"{i}. {cand}")
-    lines.append("请输出修正后的中文句子：")
+    lines = [f"拼音序列（{len(pinyin)} 个音节）：{py}"]
+    if nbest:
+        lines.append("候选转写：")
+        for i, cand in enumerate(nbest, 1):
+            lines.append(f"{i}. {cand}")
+        lines.append("请输出修正后的中文句子：")
+    else:
+        lines.append("请输出对应的中文句子：")
     return "\n".join(lines)
 
 
-def build_messages(pinyin: Sequence[str], nbest: Sequence[str],
+def build_messages(pinyin: Sequence[str], nbest: Sequence[str] | None = None,
                    answer: str = None) -> List[Dict[str, str]]:
-    msgs = [{"role": "system", "content": SYSTEM_PROMPT},
+    system = CALIBRATION_SYSTEM_PROMPT if nbest else PINYIN_SYSTEM_PROMPT
+    msgs = [{"role": "system", "content": system},
             {"role": "user", "content": build_user_prompt(pinyin, nbest)}]
     if answer is not None:
         msgs.append({"role": "assistant", "content": answer})

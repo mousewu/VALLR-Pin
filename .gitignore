@@ -25,6 +25,7 @@ exp/
 *.log
 runs/
 outputs/
+swanlog/
 
 # 本机数据路径配置。
 configs/*.local.yaml

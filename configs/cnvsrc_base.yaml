@@ -17,10 +17,17 @@ crop_size: 88
 time_mask: 4             # 时域随机遮蔽，缓解多说话人过拟合
 device: auto
 amp: true
-save_every: 5            # 每 5 epoch 存一个检查点 -> Stage-II 的 error-aware 数据源
+save_every: 5            # 训练恢复和消融分析；Stage-II 主训练不依赖这些检查点
 keep_ckpts: 8
 eval_every: 1
 seed: 0
+
+swanlab:
+  enabled: false
+  project: VALLR-Pin
+  experiment_name: stage1-cnvsrc-pinyin-only
+  mode: online
+  logdir: swanlog
 
 model:
   d_model: 512
@@ -35,6 +42,6 @@ model:
   frontend_width: 64
   in_channels: 1
   lambda_ctc: 1.0        # v2 固定为 CTC
-  alpha: 0.1             # 字符仅作辅助；90% 权重用于无声调拼音 CTC
+  alpha: 0.0             # 解耦主方案：只训练无声调拼音 CTC
   label_smoothing: 0.0
   architecture_version: 2

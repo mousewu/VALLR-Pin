@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import random
 from collections import defaultdict
@@ -103,8 +104,13 @@ def write_jsonl(path: str, rows: Sequence[Dict]) -> None:
 
 
 def split_train_val(rows: List[Dict], val_ratio: float = 0.02, seed: int = 0):
-    rng = random.Random(seed)
-    rows = list(rows)
-    rng.shuffle(rows)
-    n_val = max(1, int(len(rows) * val_ratio)) if rows else 0
-    return rows[n_val:], rows[:n_val]
+    """Group by utterance id so checkpoint variants cannot cross splits."""
+    if not 0.0 <= val_ratio < 1.0:
+        raise ValueError("val_ratio must be in [0, 1)")
+    train, val = [], []
+    threshold = round(val_ratio * 10_000)
+    for row in rows:
+        group = str(row.get("meta", {}).get("id", row.get("id", "")))
+        digest = hashlib.sha1(f"{seed}:{group}".encode()).hexdigest()
+        (val if int(digest[:8], 16) % 10_000 < threshold else train).append(row)
+    return train, val

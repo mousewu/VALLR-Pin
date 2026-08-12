@@ -5,7 +5,9 @@ out_dir: exp/stage1_pinyin_only
 epochs: 50
 batch_size: 8
 bucket_size: 40
-source_weights: {cn_cvs: 0.70, cmlr: 0.30}
+# Empty means sample every source present in the manifest at its natural rate.
+# Set explicit probabilities only after all listed sources are actually present.
+source_weights: {}
 accum_steps: 4
 lr: 5.0e-4
 warmup_steps: 10000
@@ -17,6 +19,12 @@ time_mask: 4
 amp: true
 selection_metric: ser
 seed: 2026
+swanlab:
+  enabled: false
+  project: VALLR-Pin
+  experiment_name: stage1-pinyin-only
+  mode: online
+  logdir: swanlog
 model:
   d_model: 512
   heads: 8

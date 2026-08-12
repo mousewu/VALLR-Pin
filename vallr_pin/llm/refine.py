@@ -1,4 +1,4 @@
-"""Stage-II 推理：拼音引导的候选精化 (对应论文 Eq.18)。
+"""Stage-II inference: predicted Pinyin to Mandarin text.
 
 提供两种精化器：
 
@@ -6,8 +6,7 @@
   字符 bigram 语言模型，在"预测拼音所允许的同音字集合"上做 Viterbi 解码，
   再与 N-best 一起按 (语言模型分 + 拼音一致性) 重排。它是一个诚实的下界基线，
   也让整条链路在离线/无 GPU 环境下可复现。
-* :class:`LLMRefiner` —— 论文主方案。加载 Qwen3-4B-Instruct(+LoRA)，
-  用 Eq.15 的提示词生成最终转写，并带长度/格式护栏。
+* :class:`LLMRefiner` —— 默认只接收 Stage-I 预测拼音；字符 N-best 是可选校准信息。
 """
 
 from __future__ import annotations
@@ -170,9 +169,9 @@ class NgramPinyinRefiner:
 # --------------------------------------------------------------------------- #
 #                                  LLM 精化器                                   #
 # --------------------------------------------------------------------------- #
-def apply_guard(raw_output: str, pinyin: Sequence[str], nbest: Sequence[str],
+def apply_guard(raw_output: str, pinyin: Sequence[str], nbest: Sequence[str] = (),
                 length_guard: float = 1.6) -> str:
-    """LLM 输出护栏：解析失败或明显扩写时回退到 Stage-I top-1。
+    """Reject malformed/expanded output, optionally falling back to char top-1.
 
     论文报告零样本 LLM 使 CER 从 37.23 升到 37.86，主要就是自由改写/补全造成的；
     这条规则把"改坏"的下界钉在 top-1 上。
@@ -223,13 +222,13 @@ class LLMRefiner:
         self.model = self.model.to(device).eval()
         self.device = device
 
-    def _render(self, pinyin, nbest) -> str:
+    def _render(self, pinyin, nbest=()) -> str:
         return self.tok.apply_chat_template(build_messages(pinyin, nbest), tokenize=False,
                                             add_generation_prompt=True)
 
     def refine_batch(self, items: Sequence[Dict]) -> List[str]:
         torch = self.torch
-        prompts = [self._render(it["pinyin"], it["nbest"]) for it in items]
+        prompts = [self._render(it["pinyin"], it.get("nbest", [])) for it in items]
         enc = self.tok(prompts, return_tensors="pt", padding=True,
                        add_special_tokens=False).to(self.device)
         with torch.no_grad():
@@ -239,10 +238,10 @@ class LLMRefiner:
                                       pad_token_id=self.tok.pad_token_id)
         gen = out[:, enc["input_ids"].shape[1]:]
         texts = self.tok.batch_decode(gen, skip_special_tokens=True)
-        return [apply_guard(raw, it["pinyin"], it["nbest"], self.cfg.length_guard)
+        return [apply_guard(raw, it["pinyin"], it.get("nbest", []), self.cfg.length_guard)
                 for it, raw in zip(items, texts)]
 
-    def refine(self, pinyin, nbest) -> str:
+    def refine(self, pinyin, nbest=()) -> str:
         return self.refine_batch([{"pinyin": list(pinyin), "nbest": list(nbest)}])[0]
 
 
@@ -295,20 +294,27 @@ def run_refine(cfg: RefineRunConfig) -> Dict[str, float]:
         raise ValueError(f"unknown refiner: {cfg.refiner}")
 
     before, after = ErrorStats(), ErrorStats()
+    has_char_baseline = any(item["nbest"] for item in items)
     out_rows = []
     for it, hyp in zip(items, hyps):
         top1 = it["nbest"][0] if it["nbest"] else ""
-        before.update(list(it["ref"]), list(top1))
+        if top1:
+            before.update(list(it["ref"]), list(top1))
         after.update(list(it["ref"]), list(hyp))
         out_rows.append({**it, "top1": top1, "refined": hyp})
-    stats = {"cer_stage1": before.rate, "cer_refined": after.rate,
-             "abs_gain": before.rate - after.rate, "n": len(items)}
+    stats = {"cer_stage1_char": before.rate if has_char_baseline else None,
+             "cer_refined": after.rate,
+             "abs_gain_vs_char": (before.rate - after.rate if has_char_baseline else None),
+             "n": len(items)}
     if cfg.out_jsonl:
         os.makedirs(os.path.dirname(os.path.abspath(cfg.out_jsonl)), exist_ok=True)
         with open(cfg.out_jsonl, "w", encoding="utf-8") as f:
             for r in out_rows:
                 f.write(json.dumps(r, ensure_ascii=False) + "\n")
-    print(f"[refine/{cfg.refiner}] Stage-I CER={100 * stats['cer_stage1']:.2f}% -> "
-          f"refined CER={100 * stats['cer_refined']:.2f}% "
-          f"(abs {100 * stats['abs_gain']:+.2f})", flush=True)
+    baseline = (f"char CER={100 * stats['cer_stage1_char']:.2f}% -> "
+                if has_char_baseline else "Pinyin-only -> ")
+    gain = (f" (abs {100 * stats['abs_gain_vs_char']:+.2f})"
+            if has_char_baseline else "")
+    print(f"[refine/{cfg.refiner}] {baseline}refined CER="
+          f"{100 * stats['cer_refined']:.2f}%{gain}", flush=True)
     return stats

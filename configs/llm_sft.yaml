@@ -1,15 +1,18 @@
-# Step-3：Pinyin-Guided LLM Adaptation（论文超参：lr=1e-4, r=8, alpha=32）
+# Decoupled Stage-II: dynamically corrupted toneless Pinyin -> Mandarin text.
 model_path: Qwen/Qwen3-4B-Instruct-2507
-train_jsonl: data/llm/train.jsonl
-val_jsonl: data/llm/val.jsonl
-out_dir: exp/llm_lora
+train_jsonl: data/stage2_text/train.jsonl
+val_jsonl: data/stage2_text/val.jsonl
+out_dir: exp/stage2_pinyin_llm
 
 epochs: 2
 batch_size: 2
 accum_steps: 8
+variants_per_text: 2
 lr: 1.0e-4
 warmup_ratio: 0.03
 max_length: 1024
+num_workers: 2
+grad_clip: 1.0
 
 lora_rank: 8
 lora_alpha: 32
@@ -19,3 +22,25 @@ target_modules: [q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj]
 dtype: bf16
 device: auto
 grad_ckpt: true
+seed: 2026
+
+noise:
+  clean_prob: 0.25
+  mild_prob: 0.50
+  mild_min_rate: 0.05
+  mild_max_rate: 0.18
+  severe_min_rate: 0.20
+  severe_max_rate: 0.40
+  substitution_weight: 0.45
+  deletion_weight: 0.20
+  insertion_weight: 0.15
+  mask_weight: 0.15
+  swap_weight: 0.05
+  mask_token: <mask>
+
+swanlab:
+  enabled: false
+  project: VALLR-Pin
+  experiment_name: stage2-pinyin-llm
+  mode: online
+  logdir: swanlog

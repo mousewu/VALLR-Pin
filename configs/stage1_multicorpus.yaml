@@ -38,6 +38,13 @@ selection_metric: ser
 log_every: 50
 seed: 2026
 
+swanlab:
+  enabled: false
+  project: VALLR-Pin
+  experiment_name: stage1-pinyin-aux-char
+  mode: online
+  logdir: swanlog
+
 model:
   d_model: 512
   heads: 8

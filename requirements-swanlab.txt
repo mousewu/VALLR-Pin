@@ -1,0 +1,2 @@
+-r requirements.txt
+swanlab>=0.7

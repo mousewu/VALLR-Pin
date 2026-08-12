@@ -44,6 +44,7 @@ sources:
   # CN-Celeb-AV/CNC-AV is not a supervised VSR source unless sentence-level
   # transcripts exist. Keep it disabled until reliable pseudo labels are made.
   - name: cnc_av_pseudo
+    enabled: false
     root: /DATA/CNC-AV
     annotation: pseudo_labels.jsonl
     format: jsonl
@@ -51,3 +52,32 @@ sources:
     pseudo_confidence: 0.0
     media_root: roi96
     media_glob: "**/*.npy"
+
+  # Additional CNVSRC fixed-track releases use the same generic adapters.
+  # Enable each entry only after matching its actual metadata layout.
+  - name: cnvsrc_dev
+    enabled: false
+    root: /DATA/CNVSRC-Dev
+    annotation: metadata.jsonl
+    format: jsonl
+    media_root: roi96
+    media_glob: "**/*.npy"
+    supervision: supervised
+
+  - name: cn_cvs2_p1
+    enabled: false
+    root: /DATA/CN-CVS2-P1
+    annotation: metadata.jsonl
+    format: jsonl
+    media_root: roi96
+    media_glob: "**/*.npy"
+    supervision: supervised
+
+  - name: cn_cvs3
+    enabled: false
+    root: /DATA/CN-CVS3
+    annotation: metadata.jsonl
+    format: jsonl
+    media_root: roi96
+    media_glob: "**/*.npy"
+    supervision: supervised

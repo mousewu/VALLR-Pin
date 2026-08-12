@@ -23,6 +23,7 @@ class CorpusSpec:
     name: str
     root: str
     annotation: str
+    enabled: bool = True
     format: str = "jsonl"       # jsonl | delimited | kaldi | sidecar
     media_root: str = ""
     media_glob: str = "**/*"
@@ -233,6 +234,12 @@ def build_manifests(cfg: BuildConfig) -> dict:
     speakers_by_split: Dict[str, set] = defaultdict(set)
 
     for spec in cfg.sources:
+        if not spec.enabled:
+            rejected[f"{spec.name}:source_disabled"] += 1
+            continue
+        if spec.supervision not in {"supervised", "pseudo"}:
+            raise ValueError(
+                f"{spec.name}: supervision must be supervised or pseudo for CTC training")
         if spec.supervision == "pseudo" and not cfg.allow_pseudo:
             rejected[f"{spec.name}:pseudo_disabled"] += 1
             continue

@@ -3,8 +3,10 @@
     synth            生成合成数据集 (无真实数据时跑通链路)
     train            Stage-I 拼音优先 CTC 训练
     decode           用某个检查点解码 manifest，产出 N-best + 拼音
-    decode-ckpts     用**多个检查点**解码训练集 (Stage-II 的 error-aware 数据源)
-    build-llm-data   把解码结果转成指令数据 (messages jsonl)
+    build-stage2-text 从独立中文纯文本构造干净的文字/拼音语料
+    materialize-stage2 固化在线拼音噪声，供 ms-swift 等外部训练器使用
+    decode-ckpts     用**多个检查点**解码训练集 (可选真实错误校准)
+    build-llm-data   把解码结果转成可选校准指令数据
     sft              LoRA 微调 LLM (或 --print-swift 输出 ms-swift 命令)
     refine           Stage-II 精化并报告 CER 变化
     pipeline         合成数据上的端到端演示 (train -> decode -> data -> refine)
@@ -100,7 +102,7 @@ def cmd_decode(args):
 
 
 def cmd_decode_ckpts(args):
-    """用早/中/晚多个检查点解码同一份 manifest —— 论文 Step-2 的数据来源。"""
+    """用早/中/晚检查点解码同一 manifest，构造可选的真实错误校准集。"""
     from .engine.decode import DecodeConfig, decode_manifest, load_stage1
     from .engine.trainer import list_checkpoints
     ckpts = list_checkpoints(args.exp_dir)
@@ -137,6 +139,23 @@ def cmd_build_llm_data(args):
           f"val={len(val)} -> {args.out_val}")
 
 
+def cmd_build_stage2_text(args):
+    from .llm.text_data import TextBuildConfig, TextSource, build_text_corpus
+    raw = load_yaml(args.config)
+    raw["sources"] = [TextSource(**item) for item in raw.get("sources", [])]
+    report = build_text_corpus(TextBuildConfig(**raw))
+    print(json.dumps(report, ensure_ascii=False, indent=2))
+
+
+def cmd_materialize_stage2(args):
+    from .llm.lora_sft import SftConfig
+    from .llm.text_data import materialize_instruction_data
+    cfg = fill_dataclass(SftConfig, load_yaml(args.config))
+    count = materialize_instruction_data(
+        args.input, args.output, cfg.noise, args.variants, args.seed)
+    print(f"[materialize-stage2] rows={count} -> {args.output}")
+
+
 def cmd_sft(args):
     from .llm.lora_sft import SftConfig, print_swift_command, train_lora
     cfg = fill_dataclass(SftConfig, load_yaml(args.config))
@@ -164,14 +183,14 @@ def cmd_refine(args):
 
 
 def cmd_pipeline(args):
-    """合成数据上的端到端演示，用来验证实现而非刷指标。"""
+    """Synthetic decoupled demo; validates interfaces rather than accuracy."""
     from .data.synthetic import build_synthetic_dataset
     from .engine.decode import DecodeConfig, decode_manifest, load_stage1
-    from .engine.trainer import TrainConfig, Trainer, list_checkpoints
-    from .llm.build_data import (BuildConfig, build_instruction_data, load_records,
-                                 split_train_val, write_jsonl)
+    from .engine.trainer import TrainConfig, Trainer
     from .llm.refine import NgramConfig, RefineRunConfig, run_refine
     from .models.vallr_pin import VallrPinConfig
+    from .data.dataset import read_manifest
+    from .text.pinyin import text_to_pinyin
 
     root = args.work_dir
     data = build_synthetic_dataset(os.path.join(root, "data"),
@@ -188,44 +207,34 @@ def cmd_pipeline(args):
                                             char_dec_layers=args.dec_layers,
                                             pinyin_dec_layers=2, frontend="resnet18",
                                             frontend_width=args.frontend_width,
-                                            dropout=0.1, sanm_kernel=7))
+                                            dropout=0.1, sanm_kernel=7, alpha=0.0))
     Trainer(tcfg).fit()
 
     hyp_dir = os.path.join(root, "hyps")
     os.makedirs(hyp_dir, exist_ok=True)
-    ckpts = list_checkpoints(exp)
-    keep = ckpts[:: max(1, len(ckpts) // 3)][:3] or ckpts[-1:]
-    train_hyps = []
-    for ck in keep:                       # 多检查点 -> 错误多样性
-        model, tok = load_stage1(ck, os.path.join(exp, "vocab"))
-        out = os.path.join(hyp_dir, f"train_{os.path.basename(ck)[:-3]}.jsonl")
-        decode_manifest(model, tok, DecodeConfig(manifest=data["train"],
-                                                 data_root=data["root"], out_jsonl=out,
-                                                 beam=args.beam, nbest=args.nbest,
-                                                 crop_size=32, device=args.device,
-                                                 max_utts=args.max_train_utts),
-                        tag=os.path.basename(ck))
-        train_hyps.append(out)
-
     best = os.path.join(exp, "ckpts", "best.pt")
-    ck = best if os.path.exists(best) else ckpts[-1]
-    model, tok = load_stage1(ck, os.path.join(exp, "vocab"))
+    model, tok = load_stage1(best, os.path.join(exp, "vocab"))
     dev_hyp = os.path.join(hyp_dir, "dev.jsonl")
     decode_manifest(model, tok, DecodeConfig(manifest=data["dev"], data_root=data["root"],
                                              out_jsonl=dev_hyp, beam=args.beam,
                                              nbest=args.nbest, crop_size=32,
                                              device=args.device), tag="best")
 
-    rows = build_instruction_data(load_records(train_hyps), BuildConfig(nbest=args.nbest))
-    tr, va = split_train_val(rows, 0.05)
-    write_jsonl(os.path.join(root, "llm_data", "train.jsonl"), tr)
-    write_jsonl(os.path.join(root, "llm_data", "val.jsonl"), va)
+    # Stage-II source is text-only and does not depend on any Stage-I checkpoint.
+    stage2_path = os.path.join(root, "llm_data", "train.jsonl")
+    os.makedirs(os.path.dirname(stage2_path), exist_ok=True)
+    rows = read_manifest(data["train"])
+    with open(stage2_path, "w", encoding="utf-8") as stream:
+        for row in rows:
+            stream.write(json.dumps({"id": row["id"], "text": row["text"],
+                                     "pinyin": text_to_pinyin(row["text"])[1]},
+                                    ensure_ascii=False) + "\n")
 
     stats = run_refine(RefineRunConfig(hyp_jsonl=dev_hyp,
                                        out_jsonl=os.path.join(root, "dev_refined.jsonl"),
                                        refiner="ngram", lm_texts=data["train"],
                                        nbest=args.nbest, ngram=NgramConfig()))
-    print(json.dumps({"work_dir": root, "llm_train_data": len(tr), **stats},
+    print(json.dumps({"work_dir": root, "llm_train_data": len(rows), **stats},
                      ensure_ascii=False, indent=2))
 
 
@@ -262,7 +271,7 @@ def main(argv=None):
     s.add_argument("--max-utts", type=int, default=None)
     s.set_defaults(func=cmd_decode)
 
-    s = sub.add_parser("decode-ckpts", help="多检查点解码训练集")
+    s = sub.add_parser("decode-ckpts", help="多检查点解码（可选真实错误校准）")
     s.add_argument("--exp-dir", required=True)
     s.add_argument("--manifest", required=True)
     s.add_argument("--data-root", default="")
@@ -275,7 +284,7 @@ def main(argv=None):
     s.add_argument("--max-utts", type=int, default=None)
     s.set_defaults(func=cmd_decode_ckpts)
 
-    s = sub.add_parser("build-llm-data", help="构造 error-aware 指令数据")
+    s = sub.add_parser("build-llm-data", help="构造可选 error-aware 校准数据")
     s.add_argument("--hyp", nargs="+", required=True)
     s.add_argument("--out-train", required=True)
     s.add_argument("--out-val", required=True)
@@ -285,6 +294,18 @@ def main(argv=None):
     s.add_argument("--val-ratio", type=float, default=0.02)
     s.add_argument("--seed", type=int, default=0)
     s.set_defaults(func=cmd_build_llm_data)
+
+    s = sub.add_parser("build-stage2-text", help="独立纯文本 -> 干净文字/拼音语料")
+    s.add_argument("--config", required=True)
+    s.set_defaults(func=cmd_build_stage2_text)
+
+    s = sub.add_parser("materialize-stage2", help="把在线拼音噪声固化为 messages JSONL")
+    s.add_argument("--config", default="configs/llm_sft.yaml")
+    s.add_argument("--input", required=True)
+    s.add_argument("--output", required=True)
+    s.add_argument("--variants", type=int, default=2)
+    s.add_argument("--seed", type=int, default=2026)
+    s.set_defaults(func=cmd_materialize_stage2)
 
     s = sub.add_parser("sft", help="LoRA 微调 LLM")
     s.add_argument("--config", default="")

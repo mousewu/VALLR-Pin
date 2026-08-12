@@ -2,18 +2,19 @@
 
 ## 1. 训练目标与对照实验
 
-第一轮不要使用 CNC-AV 伪标签，也不要接 Stage-II。固定同一份 ROI、同一 speaker-independent
-划分、同一视觉编码器和相同 optimizer steps，依次训练：
+第一轮不要使用 CNC-AV 伪标签。固定同一份 ROI、同一 speaker-independent 划分、同一视觉
+编码器和相同 optimizer steps，依次训练。Pinyin-CTC 是解耦主方案，其余两组是消融：
 
 | 实验 | `alpha` | 最佳模型指标 | 目的 |
 |---|---:|---|---|
 | Char-CTC | 1.0 | dev CER | 直接汉字基线 |
 | Pinyin-CTC | 0.0 | dev SER | 检验音节中介本身 |
-| Pinyin + Char auxiliary | 0.1 | dev SER | 主方案，检查字符辅助是否改善表示 |
+| Pinyin + Char auxiliary | 0.1 | dev SER | 可选消融，检查字符辅助是否改善表示 |
 
-主方案约 53M 参数（字符表按 7k 估算）。输入是连续 25fps、96×96 灰度嘴部 ROI，训练时随机裁
-88×88；前端和 SANM 都保持逐帧时间长度。必须同时报告字符 CER、无声调拼音 SER，以及
-S/D/I 分解。最终模型再用 CTC prefix beam 报告 N-best oracle 指标。
+模型约 53M 参数（字符表按 7k 估算，虽然 Pinyin-only 不反传字符头）。输入是连续 25fps、96×96 灰度嘴部 ROI，训练时随机裁
+88×88；前端和 SANM 都保持逐帧时间长度。Pinyin-only 必须报告无声调拼音 SER 及
+S/D/I 分解，并用 CTC prefix beam 报告拼音 N-best oracle；只有 Char-CTC 和字符辅助实验
+才报告 Stage-I 字符 CER。所有方案都应报告 Stage-II 最终 CER。
 
 ## 2. 数据角色
 
@@ -21,6 +22,9 @@ S/D/I 分解。最终模型再用 CTC prefix beam 报告 N-best oracle 指标。
 - **CMLR**：高质量有文本监督数据；建议采样概率 0.30，并保留独立测试集做跨库评估。
 - **CNC-AV / CN-Celeb-AV**：若发布包没有句级转写，不属于监督 VSR 数据。第一轮完全排除；
   后续只能加入置信度至少 0.95、且 ASR 与人工抽检通过的 pseudo label，采样概率从 0.05 开始。
+- **其他中文 VSR 数据**：manifest 构建器不硬编码数据集名称；JSONL、CSV/TSV、Kaldi 和 sidecar
+  标注均可作为独立 `sources` 项加入。默认 Pinyin-only 配置的 `source_weights: {}` 会自动使用
+  manifest 中全部来源。只有需要重平衡时才填写显式来源权重。
 
 数据许可可能限制商业用途，原始文件和生成 ROI 不应提交 Git。
 
@@ -102,7 +106,7 @@ python -m vallr_pin.cli train --config configs/stage1_multicorpus.yaml \
 
 ```bash
 torchrun --standalone --nproc_per_node=8 -m vallr_pin.cli train \
-  --config configs/stage1_multicorpus.yaml
+  --config configs/stage1_pinyin_only.yaml
 ```
 
 多节点使用标准 `torchrun --nnodes --node_rank --master_addr --master_port` 参数。每个进程只取自己
@@ -112,8 +116,8 @@ torchrun --standalone --nproc_per_node=8 -m vallr_pin.cli train \
 
 ```bash
 torchrun --standalone --nproc_per_node=8 -m vallr_pin.cli train \
-  --config configs/stage1_multicorpus.yaml \
-  --set resume=exp/stage1_pinyin_auxchar/ckpts/last.pt
+  --config configs/stage1_pinyin_only.yaml \
+  --set resume=exp/stage1_pinyin_only/ckpts/last.pt
 ```
 
 `last.pt` 包含模型、optimizer、GradScaler、epoch、global step 和 RNG；`best.pt` 是轻量推理检查点。
@@ -142,8 +146,9 @@ torchrun --standalone --nproc_per_node=8 -m vallr_pin.cli train --config configs
 研究验收：
 
 - Pinyin-only 的 SER 显著低于直接字符模型映射出的拼音错误率；
-- 主方案在至少两个随机种子上优于 Pinyin-only，才能证明字符辅助有效；
-- Stage-II 必须相对主方案 top-1 CER 有稳定提升，且 over-correction rate 单独报告；
+- 字符辅助消融在至少两个随机种子上优于 Pinyin-only，才能宣称该辅助头有效；
+- Stage-II 必须相对“拼音 top-1 直接转写”和“无微调 LLM”基线有稳定提升，且
+  over-correction rate 单独报告；
 - CMLR/CN-CVS 交叉库测试不能只报告混合 dev 集均值。
 
 在真实训练结果出现前，任何架构优劣都只能称为待验证假设。

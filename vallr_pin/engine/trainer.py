@@ -7,6 +7,7 @@ import math
 import os
 import random
 import time
+import dataclasses
 from contextlib import nullcontext
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
@@ -22,6 +23,7 @@ from ..data.samplers import DistributedBucketBatchSampler
 from ..models.vallr_pin import VallrPin, VallrPinConfig
 from ..text.tokenizer import DualTokenizer
 from .metrics import ErrorStats
+from .tracking import SwanLabConfig, SwanLabTracker
 
 
 @dataclass
@@ -59,6 +61,7 @@ class TrainConfig:
     log_every: int = 50
     seed: int = 0
     model: VallrPinConfig = field(default_factory=VallrPinConfig)
+    swanlab: SwanLabConfig = field(default_factory=SwanLabConfig)
 
 
 def _dist_info() -> tuple[int, int, int]:
@@ -145,6 +148,7 @@ class Trainer:
             self._resume(cfg.resume)
         if self.is_main:
             self._write_config()
+        self.tracker = SwanLabTracker(cfg.swanlab, cfg, self.is_main)
 
     @staticmethod
     def _seed(seed: int) -> None:
@@ -193,8 +197,7 @@ class Trainer:
 
     def _write_config(self) -> None:
         with open(os.path.join(self.cfg.out_dir, "config.json"), "w", encoding="utf-8") as stream:
-            values = {k: v for k, v in self.cfg.__dict__.items() if k != "model"}
-            values["model"] = self.cfg.model.to_dict()
+            values = dataclasses.asdict(self.cfg)
             values["world_size"] = self.world_size
             json.dump(values, stream, ensure_ascii=False, indent=2)
 
@@ -213,37 +216,54 @@ class Trainer:
 
     def fit(self) -> str:
         best_path = os.path.join(self.cfg.out_dir, "ckpts", "best.pt")
-        for epoch in range(self.start_epoch, self.cfg.epochs + 1):
-            self.train_batch_sampler.set_epoch(epoch)
-            stats = self._train_epoch(epoch)
-            if self.is_main:
-                msg = " ".join(f"{k}={v:.4f}" for k, v in stats.items())
-                print(f"[epoch {epoch:03d}] {msg} lr={_lr_at(self.step, self.cfg):.2e}",
-                      flush=True)
-
-            eval_stats = None
-            if self.dev_loader is not None and epoch % self.cfg.eval_every == 0:
-                eval_stats = self.evaluate()
-                metric = eval_stats[self.cfg.selection_metric]
+        try:
+            for epoch in range(self.start_epoch, self.cfg.epochs + 1):
+                self.train_batch_sampler.set_epoch(epoch)
+                stats = self._train_epoch(epoch)
                 if self.is_main:
-                    print(f"           dev char_CER={100*eval_stats['cer']:.2f}% "
-                          f"pinyin_SER={100*eval_stats['ser']:.2f}%", flush=True)
-                    self._append_metrics(epoch, stats, eval_stats)
-                    if metric < self.best:
-                        self.best = metric
-                        self._raw_model().save(best_path, tokenizer_dir="vocab", epoch=epoch,
-                                               step=self.step, **eval_stats)
-            if self.is_main:
-                self._save_last(epoch)
-                if epoch % self.cfg.save_every == 0:
-                    self._raw_model().save(
-                        os.path.join(self.cfg.out_dir, "ckpts", f"ckpt_ep{epoch}.pt"),
-                        tokenizer_dir="vocab", epoch=epoch, step=self.step,
-                        **(eval_stats or {}))
-                    self._prune_ckpts()
-            _barrier()
-        if dist.is_initialized():
-            dist.barrier()
+                    msg = " ".join(f"{k}={v:.4f}" for k, v in stats.items())
+                    print(f"[epoch {epoch:03d}] {msg} lr={_lr_at(self.step, self.cfg):.2e}",
+                          flush=True)
+
+                eval_stats = None
+                if self.dev_loader is not None and epoch % self.cfg.eval_every == 0:
+                    eval_stats = self.evaluate()
+                    metric = eval_stats[self.cfg.selection_metric]
+                    if metric is None:
+                        raise ValueError(
+                            f"selection_metric={self.cfg.selection_metric} is disabled by alpha="
+                            f"{self.cfg.model.alpha}")
+                    if self.is_main:
+                        cer_text = (f"{100*eval_stats['cer']:.2f}%"
+                                    if eval_stats["cer"] is not None else "disabled")
+                        ser_text = (f"{100*eval_stats['ser']:.2f}%"
+                                    if eval_stats["ser"] is not None else "disabled")
+                        print(f"           dev char_CER={cer_text} pinyin_SER={ser_text}",
+                              flush=True)
+                        self._append_metrics(epoch, stats, eval_stats)
+                        if metric < self.best:
+                            self.best = metric
+                            save_stats = {k: v for k, v in eval_stats.items() if v is not None}
+                            self._raw_model().save(best_path, tokenizer_dir="vocab", epoch=epoch,
+                                                   step=self.step, **save_stats)
+                if self.is_main:
+                    metrics = {f"train/{k}": v for k, v in stats.items()}
+                    metrics.update({f"dev/{k}": v for k, v in (eval_stats or {}).items()})
+                    metrics.update({"epoch": epoch, "train/lr": _lr_at(self.step, self.cfg)})
+                    self.tracker.log(metrics, self.step)
+                    self._save_last(epoch)
+                    if epoch % self.cfg.save_every == 0:
+                        save_stats = {k: v for k, v in (eval_stats or {}).items()
+                                      if v is not None}
+                        self._raw_model().save(
+                            os.path.join(self.cfg.out_dir, "ckpts", f"ckpt_ep{epoch}.pt"),
+                            tokenizer_dir="vocab", epoch=epoch, step=self.step, **save_stats)
+                        self._prune_ckpts()
+                _barrier()
+            if dist.is_initialized():
+                dist.barrier()
+        finally:
+            self.tracker.finish()
         return best_path if os.path.exists(best_path) else os.path.join(
             self.cfg.out_dir, "ckpts", f"ckpt_ep{self.cfg.epochs}.pt")
 
@@ -296,23 +316,29 @@ class Trainer:
             batch = self._to_device(batch)
             memory, mask = raw.encode(batch["video"], batch["video_lens"])
             lengths = mask.sum(-1)
-            char_hyp = raw.ctc_greedy(raw.char_ctc, memory, lengths)
-            py_hyp = raw.ctc_greedy(raw.pinyin_ctc, memory, lengths)
-            for row in range(len(char_hyp)):
-                ref_c = self.tok.char.decode(
-                    batch["char_ids"][row, :batch["char_lens"][row]].tolist())
-                ref_p = self.tok.pinyin.decode(
-                    batch["pinyin_ids"][row, :batch["pinyin_lens"][row]].tolist())
-                chars.update(ref_c, self.tok.char.decode(char_hyp[row]))
-                pinyin.update(ref_p, self.tok.pinyin.decode(py_hyp[row]))
+            char_hyp = (raw.ctc_greedy(raw.char_ctc, memory, lengths)
+                        if self.cfg.model.alpha > 0.0 else None)
+            py_hyp = (raw.ctc_greedy(raw.pinyin_ctc, memory, lengths)
+                      if self.cfg.model.alpha < 1.0 else None)
+            for row in range(len(batch["ids"])):
+                if char_hyp is not None:
+                    ref_c = self.tok.char.decode(
+                        batch["char_ids"][row, :batch["char_lens"][row]].tolist())
+                    chars.update(ref_c, self.tok.char.decode(char_hyp[row]))
+                if py_hyp is not None:
+                    ref_p = self.tok.pinyin.decode(
+                        batch["pinyin_ids"][row, :batch["pinyin_lens"][row]].tolist())
+                    pinyin.update(ref_p, self.tok.pinyin.decode(py_hyp[row]))
         numbers = torch.tensor([chars.sub, chars.dele, chars.ins, chars.total,
                                 pinyin.sub, pinyin.dele, pinyin.ins, pinyin.total],
                                dtype=torch.long, device=self.device)
         if dist.is_initialized():
             dist.all_reduce(numbers)
         values = numbers.tolist()
-        return {"cer": sum(values[:3]) / max(values[3], 1),
-                "ser": sum(values[4:7]) / max(values[7], 1),
+        return {"cer": (sum(values[:3]) / max(values[3], 1)
+                        if self.cfg.model.alpha > 0.0 else None),
+                "ser": (sum(values[4:7]) / max(values[7], 1)
+                        if self.cfg.model.alpha < 1.0 else None),
                 "char_sub": values[0], "char_del": values[1], "char_ins": values[2],
                 "pinyin_sub": values[4], "pinyin_del": values[5], "pinyin_ins": values[6]}
 

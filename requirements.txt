@@ -14,3 +14,4 @@ accelerate>=0.30
 # mediapipe>=0.10      # 从原始视频抽取 Face Landmarker 轨迹
 # ms-swift>=3.0        # 论文使用的微调框架（本仓库自带等价实现）
 # deepspeed>=0.14      # 多卡 LoRA 训练
+# swanlab>=0.7         # 可选实验跟踪；配置 swanlab.enabled=true 时需要

@@ -16,7 +16,8 @@ v1 把卖点放在"多任务学习 + LLM 后处理"，v2 改用**不确定性分
 factorization）来论证——普通话 VSR 直接预测字符是病态问题，因为视觉证据只能约束到
 音节层；v2 另外补了 CMLR 数据集实验、把 baseline 换成"Paraformer 化的 CNVSRC 2025 baseline"，
 并明确 LLM 是**约束式的补充**而非独立识别器。审查后保留了“拼音中介”，但废弃了
-双自回归视觉解码器：当前 Stage-I 是**拼音优先的双 CTC**，并严格保留视频时间轴。
+双自回归视觉解码器。当前默认主链路完全解耦：Stage-I 是**拼音-only CTC**，Stage-II
+用独立中文纯文本训练“带噪拼音→原文”；字符 CTC 只保留为可选辅助头和消融实验。
 
 > 兼容性提示：旧双 AR 检查点属于 `architecture_version=1`，不会被静默部分加载；
 > 需要用当前配置重新训练。这样可以避免看似成功、实际参数错配的实验。
@@ -34,10 +35,10 @@ factorization）来论证——普通话 VSR 直接预测字符是病态问题�
 于是把推理显式分解成两层（论文 Eq.5）：
 
 ```
-P(Y|X) = Σ_P P(Y | P, X) · P(P | X)
+P(Y|X) = Σ_P P(Y | P) · P(P | X)
          └── 语言层 (LLM) ──┘  └ 视觉层 (VSR) ┘
 
-X --F_VSR--> (Ŷ_1..K , P̂) --F_LLM--> Y
+X --F_VSR--> P̂ --F_LLM--> Y
 ```
 
 - **视觉层**只需要解决"这段唇动是什么音"——这是它擅长且可学的；
@@ -52,30 +53,27 @@ X --F_VSR--> (Ŷ_1..K , P̂) --F_LLM--> Y
 ## 2. 总体架构
 
 ```
-                    ┌────────── Stage I：拼音优先、时间保持的 CTC ──────────┐
- 唇部ROI视频 X ──► 3D Conv stem ──► ResNet ──► SANM Encoder ──┬──► 拼音 CTC (0.9) ─► Pinyin N-best
-   (T,1,88,88)                         输出仍为 T 个时序状态 └──► 字符 CTC (0.1) ─► 辅助 N-best
-                    └──────────────────────────────────────────────────────┘
-                                          │  P̂ + {Ŷ(k)}
-                                          ▼
-                    ┌────────── Stage II：拼音引导的 LLM 精化 ──────────┐
-                     Prompt(拼音, N-best, 长度/格式约束) ─► Qwen3-4B-Instruct + LoRA ─► Y
-                     LoRA 在"模型自己产生的错误"上训练 (error-aware)
-                    └──────────────────────────────────────────────────┘
+唇部 ROI 视频 X ─► 3D stem + ResNet + SANM ─► 拼音 CTC ─► Pinyin N-best
+                                                       │
+独立中文纯文本 ─► 无声调拼音 ─► 在线替换/删除/插入/mask ─► LLM LoRA
+                                                       │
+推理：Pinyin top-1/N-best ────────────────────────────► 最终文字 Y
+
+可选消融：共享视觉编码器 ─► 低权重字符 CTC（不作为 Stage-II 必需输入）
 ```
 
 四个步骤与论文 Fig.1 一一对应：
 
 | 步骤 | 内容 | 本仓库入口 |
 |---|---|---|
-| Step 1 | 拼音优先的 CTC VSR 训练 | `cli train` |
-| Step 2 | 多检查点解码训练集 → error-aware 指令数据 | `cli decode-ckpts` + `cli build-llm-data` |
-| Step 3 | 拼音引导的 LLM LoRA 适配 | `cli sft` |
+| Step 1 | 视频→无声调拼音 CTC | `cli train` |
+| Step 2 | 独立纯文本→干净文字/拼音语料 | `cli build-stage2-text` |
+| Step 3 | 在线拼音加噪→LLM LoRA | `cli sft` |
 | Step 4 | 推理：Stage-I 解码 → Stage-II 精化 | `cli decode` + `cli refine` |
 
 ---
 
-## 3. Stage-I：拼音优先的双 CTC
+## 3. Stage-I：拼音-only CTC
 
 ### 3.1 视觉前端与编码器
 
@@ -91,21 +89,21 @@ X --F_VSR--> (Ŷ_1..K , P̂) --F_LLM--> Y
 | 分支 | 结构 | 建模单元 | 作用 |
 |---|---|---|---|
 | 拼音主头 | 线性层 + CTC prefix beam | 无声调音节（约 410） | 学习视觉可辨的音节并产出 N-best |
-| 字符辅助头 | 线性层 + CTC prefix beam | 汉字 | 低权重正则及候选，不承担主语言建模 |
+| 字符辅助头（可选） | 线性层 + CTC prefix beam | 汉字 | 仅用于消融或推理重排实验 |
 
-当前损失为：
+默认主方案损失为：
 
 ```
-L = 0.9 · L_ctc^pinyin + 0.1 · L_ctc^char
+L = L_ctc^pinyin
 ```
 
-拼音不再是字符识别的辅助正则，而是 Stage-I 主目标。这样视觉模型主要优化它真正能观测
-到的发音信息，字符头只保留少量视觉相关候选。任何目标长度超过有效视频帧数的样本都会
-立即报错，避免 CTC 用零损失掩盖错误切段。
+`alpha=0.1` 的拼音+字符辅助和 `alpha=1.0` 的字符-only 仍用于公平消融，但不属于推理接口
+的必需部分。任何目标长度超过有效视频帧数的样本都会立即报错，避免 CTC 用零损失掩盖错误切段。
 
 ### 3.3 N-best 与拼音假设
 
-- 字符侧与拼音侧都使用标准 **CTC prefix beam**；解码记录同时保存拼音 N-best：
+- 拼音侧使用标准 **CTC prefix beam**。只有检查点实际训练过字符头时才解码字符候选；
+  `alpha=0` 不会运行随机初始化的字符头：
 
   ```
   score(Y) = log P_ctc(Y | X) / |Y|^lp
@@ -116,49 +114,42 @@ L = 0.9 · L_ctc^pinyin + 0.1 · L_ctc^char
 
 ---
 
-## 4. Stage-II：拼音引导的 LLM 精化
+## 4. Stage-II：解耦的带噪拼音→文字 LLM
 
-### 4.1 提示词（对应 Eq.15）
+### 4.1 独立纯文本数据
+
+Stage-II 不解码 Stage-I 训练集，而是从字幕、访谈、口语转写和通用中文文本中构建：
 
 ```
-system: 你是中文唇语识别（VSR）系统的后处理专家 …… 只输出一句中文，字数应与音节数一致，
-        不要扩写、不要改写句意。
-user:   拼音序列（12 个音节）：wo de shou ji fang zai zhuo zi shang le
-        候选转写：
-        1. 我的收集放在桌子上了
-        2. 我的手机放在桌子上了
-        …
-        请输出修正后的中文句子：
+原文：我的手机放在桌子上
+干净拼音：wo de shou ji fang zai zhuo zi shang
+在线噪声：wo de shou qi fang zai zhuo <mask> shang
+监督答案：我的手机放在桌子上
 ```
 
-三类信息缺一不可：**拼音**是硬约束，**N-best** 提供词法先验与视觉后验排序，
-**格式/长度约束**用来压制过度生成。论文里零样本 LLM 反而使 CER 变差
-（37.23 → 37.86），主要就是自由改写/补全造成的——所以本实现在解码侧还加了
-**长度护栏**：输出长度超过音节数的 1.6 倍即回退到 top-1（"宁可不改，不可乱改"）。
+`build-stage2-text` 负责清洗、整句多音字 G2P、去重、按文档切分以及排除 VSR dev/test
+中的完全相同句子。生成的 JSONL 只保存干净 `text+pinyin`，不依赖视频或 Stage-I 检查点。
 
-### 4.2 Error-Aware 指令数据（Step 2，论文的关键 trick）
+### 4.2 在线拼音噪声
 
-用**早/中/晚期多个检查点**解码训练集，得到 CER 分布很宽的假设，与真值配成指令对。
-本实现在此之上补了三条工程约束（`vallr_pin/llm/build_data.py`）：
+LoRA 数据集在每个 epoch 动态产生替换、删除、插入、相邻交换和 `<mask>`。默认 25% 保持
+干净、50% 轻噪声、25% 重噪声，既模拟 Pinyin CTC 错误，也让模型学会不要过度纠正。
+`variants_per_text` 提供虚拟扩增，不需要把多个副本写到磁盘。
 
-| 约束 | 默认 | 理由 |
-|---|---|---|
-| `max_cer` | 0.8 | 几乎全错的样本只会教模型凭空编造 |
-| `keep_correct` | 0.25 | Stage-I 已经正确的样本要按比例保留，否则模型学到"输入总是错的"偏置，把对的改错（over-correction） |
-| CER 分桶 + 去重 | 5 桶 | 简单样本量大，不均衡会淹没困难样本 |
+### 4.3 LoRA 与可选真实错误校准
 
-### 4.3 LoRA 微调（Step 3，论文 Eq.16–17）
+`W = W₀ + AB`，默认 `r=8, α=32, lr=1e-4`，只对 assistant 答案计算损失。原生训练器支持
+`torchrun` 单机多卡 DDP；每张卡独立加载一个基座模型副本。若使用 ms-swift，先用
+`materialize-stage2` 把在线噪声固化为 messages JSONL。
 
-`W = W₀ + AB`，`r=8, α=32, lr=1e-4`，仅对 assistant 段计算损失（提示词必须 mask，
-否则模型会去学复述拼音和候选，白白消耗容量）。提供两条路径：
-
-- `cli sft --print-swift`：打印与论文一致的 **ms-swift** 命令（+DeepSpeed）；
-- `cli sft`：仅依赖 `transformers + peft` 的自实现训练循环，便于在没有 swift 的环境复现。
+原来的 `decode-ckpts + build-llm-data` 仍保留，但只定位为可选的小规模真实错误校准，
+不再决定 Stage-II 主训练数据量。
 
 ### 4.4 无 LLM 基线：拼音受限的 n-gram 重打分
 
 `vallr_pin/llm/refine.py::NgramPinyinRefiner`。用训练文本上的字符 bigram，在
-"预测拼音允许的同音字集合"上做 Viterbi（本质就是经典拼音输入法解码），再与 N-best 一起按
+"预测拼音允许的同音字集合"上做 Viterbi（本质就是经典拼音输入法解码）。有字符 N-best
+时可附加候选提示，没有时也能独立运行：
 
 ```
 score(Y) = LM(Y)/|Y| − β · SER(pinyin(Y), P̂)          β = 6
@@ -183,17 +174,20 @@ vallr_pin/
 │   ├── frontend.py        3D stem + ResNet-18/34/50
 │   ├── sanm.py            FSMN memory / SANM 自注意力 / 编解码层
 │   ├── decoders.py        SANM 编码器（旧 AR 类仅供历史代码参考）
-│   └── vallr_pin.py       拼音优先双 CTC、prefix beam、严格长度校验
+│   └── vallr_pin.py       拼音 CTC 主头、可选字符 CTC、prefix beam、长度校验
 ├── engine/
-│   ├── trainer.py         训练循环、Noam 调度、多检查点保存与均匀保留
-│   ├── decode.py          N-best + 拼音假设输出（含 oracle CER 统计）
+│   ├── trainer.py         Stage-I DDP、Noam 调度、精确恢复
+│   ├── tracking.py        可选 SwanLab rank-0 指标记录
+│   ├── decode.py          拼音 N-best；字符头按配置可选
 │   └── metrics.py         CER / 音节错误率（S+D+I）/N
 ├── llm/
-│   ├── prompt.py          Eq.15 提示词与输出解析
-│   ├── build_data.py      error-aware 指令数据构造（过滤/分桶/去重）
-│   ├── lora_sft.py        LoRA SFT（自实现 + ms-swift 命令）
+│   ├── text_data.py       独立中文纯文本清洗、G2P、按文档切分
+│   ├── noise.py           在线拼音替换/删除/插入/mask/交换
+│   ├── prompt.py          无候选主提示词 + 可选校准提示词
+│   ├── build_data.py      可选真实 VSR 错误校准数据
+│   ├── lora_sft.py        LoRA SFT（DDP + SwanLab + ms-swift 命令）
 │   └── refine.py          LLM 精化器、n-gram 受限重打分器、批量评测入口
-└── cli.py                 synth / train / decode / decode-ckpts / build-llm-data / sft / refine / pipeline
+└── cli.py                 train / decode / build-stage2-text / sft / refine / pipeline
 configs/  cnvsrc_base.yaml（论文规格）· smoke.yaml（小规模）· llm_sft.yaml
 scripts/  prepare_manifest.py（CNVSRC/CMLR→manifest+ROI）· run_full_pipeline.sh
 tests/    test_pipeline_units.py
@@ -218,13 +212,27 @@ cp configs/corpora.example.yaml configs/corpora.local.yaml
 python scripts/build_stage1_manifests.py configs/corpora.local.yaml
 python scripts/audit_stage1_data.py data/stage1/{train,dev,test}.jsonl --out data/stage1/audit.json
 torchrun --standalone --nproc_per_node=8 -m vallr_pin.cli train \
-  --config configs/stage1_multicorpus.yaml
+  --config configs/stage1_pinyin_only.yaml
 ```
 
 如果 `CNC-AV` 指的是 `CN-Celeb-AV`，它在没有句级转写时不能作为监督 Stage-I 数据；
 默认 manifest 配置会关闭该 pseudo source。
 
-### 6.1 合成数据端到端演示（无需真实数据）
+### 6.1 构建并多卡训练 Stage-II
+
+```bash
+cp configs/stage2_text.example.yaml configs/stage2_text.local.yaml
+python -m vallr_pin.cli build-stage2-text --config configs/stage2_text.local.yaml
+
+torchrun --standalone --nproc_per_node=8 -m vallr_pin.cli sft \
+  --config configs/llm_sft.yaml
+```
+
+启用 SwanLab 时，在对应 YAML 中设置 `swanlab.enabled: true` 和 `mode: online`。DDP 默认只由
+rank 0 记录已经跨卡聚合的 epoch 指标，避免同一实验重复八份日志。
+首次启用前执行 `pip install -r requirements-swanlab.txt` 和 `swanlab login`。
+
+### 6.2 合成数据端到端演示（无需真实数据）
 
 ```bash
 python -m vallr_pin.cli pipeline --work-dir exp/demo --epochs 60 --device cpu
@@ -235,7 +243,7 @@ python -m vallr_pin.cli pipeline --work-dir exp/demo --epochs 60 --device cpu
 （手机/收集、事件/时间、权利/权力、报到/报道……），Stage-I 必然在这些位置犯同音错误，
 而拼音分支不会——正好用来检验 Stage-II 是否真的在起作用。
 
-### 6.2 从网络视频自建数据集
+### 6.3 从网络视频自建数据集
 
 **最省事的路径**：找有**人工字幕的单人口播**素材，这类视频不需要 ASR、不需要
 对齐、不需要 ASD，字幕直接就是句级标签。批量筛选 + 构建一条命令：
@@ -298,15 +306,20 @@ k-gram 锚点、取单调子序列、块内 DP，最后按句统计匹配率，�
 ### 6.3 公开数据集（CNVSRC / CMLR）
 
 ```bash
-# 1) 转 manifest（建议同时预处理 ROI 成 npy）
-python scripts/prepare_manifest.py --transcript labels.txt --video-dir videos \
-    --out data/cnvsrc/train.jsonl --to-npy data/cnvsrc/roi --roi-size 96
+# 1) 在 corpora.local.yaml 中按实际发行包填写 CN-CVS、CMLR，并可启用
+#    CNVSRC.Dev、CN-CVS2-P1、CN-CVS3 等其他有句级文本的来源。
+cp configs/corpora.example.yaml configs/corpora.local.yaml
+python scripts/build_stage1_manifests.py configs/corpora.local.yaml
+python scripts/audit_stage1_data.py data/stage1/{train,dev,test}.jsonl \
+  --out data/stage1/audit.json
 
-# 2) 四步流程
-bash scripts/run_full_pipeline.sh exp/vallr_pin_cnvsrc configs/cnvsrc_base.yaml
+# 2) 视频和纯文本两阶段解耦训练
+GPUS=8 bash scripts/run_full_pipeline.sh exp/vallr_pin_cnvsrc \
+  configs/stage1_pinyin_only.yaml configs/stage2_text.local.yaml
 ```
 
-manifest 每行：`{"id": "utt_0001", "video": "roi/utt_0001.npy", "text": "今天可能会下雨"}`
+manifest 每行除 `id/video/text` 外还应带 `speaker_id/source/split/n_frames`；
+训练器不硬编码数据集名称，`source_weights: {}` 会按 manifest 中的自然比例使用全部来源。
 
 ---
 
@@ -402,9 +415,10 @@ python scripts/build_dataset_catalog.py data/derived/*/*/manifest.jsonl \
 | 训练数据 | CNVSRC 2025 固定赛道 S3 = CN-CVS + CNVSRC.Dev + CN-CVS2-P1 + CN-CVS3 |
 | 评测集 | CNVSRC-Multi.Dev（43 说话人：23 录音棚 + 20 网络视频）、CMLR、自采集 |
 | 前端/编码器 | 3D Conv + ResNet-50，12 层 SANM，d=512 |
-| 损失 | 0.9×拼音 CTC + 0.1×字符辅助 CTC |
-| 解码 | 拼音/字符 CTC prefix beam=10，nbest=5 |
-| LLM | Qwen3-4B-Instruct-2507 + LoRA(r=8, α=32, lr=1e-4)，ms-swift + DeepSpeed |
+| 主损失 | 拼音 CTC；字符-only/辅助字符 CTC 作为消融 |
+| 解码 | 拼音 CTC prefix beam=10，nbest=5 |
+| LLM 数据 | 与视频解耦的中文纯文本，在线合成 Pinyin CTC 风格噪声 |
+| LLM | Qwen3-4B-Instruct-2507 + LoRA(r=8, α=32, lr=1e-4)，原生 DDP 或 ms-swift |
 | 指标 | CER = (S+D+I)/N |
 
 论文报告的参照值（CER%，越低越好）：
@@ -454,8 +468,9 @@ d_model=128 / 4 层 SANM / ResNet-18(width=16)，MacBook CPU 训练 60 epoch，�
 | bigram LM（40 句训练 / 10 句留出） | 15.79% | 20.00% | −26.7%（变差） |
 
 第一行说明**拼音约束确实能把同音错误改回来**；第二行同样重要：一个只见过 40 个句子的
-n-gram 语言模型**没有世界知识**，在没见过的句子上会越改越错——这正是论文必须用 LLM
-而不是传统 LM 做这一步的原因，也是"零样本 LLM 会变差、必须做 error-aware 微调"的同一个道理。
+n-gram 语言模型**没有世界知识**，在没见过的句子上会越改越错——这说明 Stage-II
+需要有语言知识的 LLM，并需通过大规模带噪拼音→原文微调学会遵守拼音约束；真实 VSR
+error-aware 样本只是可选校准，不是数据主体。
 
 **过度纠正的真实代价**：当 Stage-I 已经全对（CER 0.00%）时，n-gram 精化器仍会改坏
 50 句中的 1 句（CER 0.00% → 0.20%）。改坏的原因不是语言模型，而是**拼音预测本身的错误
@@ -564,20 +579,18 @@ python scripts/analyze_refine.py exp/demo/dev_refined.jsonl
 
 论文只有 5 页，很多工程细节未写明；以下是本实现补齐或增强的部分，均已在代码中注明：
 
-1. **拼音/字符 CTC prefix beam**：不再把视觉序列交给自回归语言解码器；直接保留
-   拼音 posterior 的 N-best，为后续 lattice-aware 精化留下接口。
-2. **over-correction 防护**：`keep_correct` 保留一定比例"Stage-I 已正确"的样本进指令集，
-   否则微调后的 LLM 会把对的也改错——这是 ASR 纠错里最常见的翻车方式。
-3. **长度/格式护栏**：输出长度异常时回退 top-1，直接对应论文中零样本 LLM 变差的现象。
-4. **指令数据的 CER 分桶与去重**：多检查点解码会产生大量重复/极端样本。
+1. **两阶段训练解耦**：Stage-II 主数据来自独立中文纯文本，数据量不受视频规模限制。
+2. **在线 Pinyin CTC 风格噪声**：每个 epoch 动态生成替换、删除、插入、mask 和交换；
+   25% 干净样本用于抑制 over-correction。
+3. **可选真实错误校准**：多检查点解码和 CER 分桶保留为后续校准工具，不再是主训练入口。
+4. **长度/格式护栏**：输出异常时，有字符 top-1 则回退；纯拼音模式返回空并计为错误。
 5. **无 LLM 的受限重打分基线**：给出"拼音约束到底值多少"的下界，也让整条链路可离线复现。
 6. **多音字整句消歧**：拼音标签用整句 pypinyin 转换（词组消歧），逐字转换会让"银行/行走"
    这类标签错误，直接污染拼音分支的监督信号。
-7. **训练期检查点的均匀保留策略**：`_prune_ckpts` 保证早/中/晚都有代表，Step-2 才有 CER 梯度。
+7. **单机多卡与 SwanLab**：Stage-I、Stage-II 都支持 `torchrun`，rank 0 记录聚合指标。
 8. **严格 CTC 长度校验**：标签长于有效帧时立即拒绝样本，不允许 `zero_infinity`
    把错误切段伪装成零损失。
-9. **相对拼音一致性打分**：拼音项以"N-best 能达到的最小 SER"为基线，
-   `P̂` 整体不可靠时该项自动失效，把排序权交回语言模型。
+9. **按文档切分和污染排除**：同一文档不跨 Stage-II train/val/test，并可排除 VSR dev/test 原句。
 
 ## 10. 已知局限
 

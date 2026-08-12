@@ -32,6 +32,7 @@ class DecodeConfig:
     device: str = "auto"
     max_utts: Optional[int] = None
     num_workers: int = 0
+    include_char_hypotheses: Optional[bool] = None  # auto: only when alpha > 0
 
 
 @torch.no_grad()
@@ -51,8 +52,11 @@ def decode_manifest(model: VallrPin, tok: DualTokenizer, cfg: DecodeConfig,
         video = batch["video"].to(device)
         vlens = batch["video_lens"].to(device)
         memory, mask = model.encode(video, vlens)
-        hyps = model.beam_search_chars(memory, mask, beam=cfg.beam, nbest=cfg.nbest,
-                                       length_penalty=cfg.length_penalty)
+        use_chars = (model.cfg.alpha > 0.0 if cfg.include_char_hypotheses is None
+                     else cfg.include_char_hypotheses)
+        hyps = (model.beam_search_chars(memory, mask, beam=cfg.beam, nbest=cfg.nbest,
+                                        length_penalty=cfg.length_penalty)
+                if use_chars else [])
         nbest = [{"text": tok.decode_chars(h.tokens), "score": round(h.score, 4),
                   "att": round(h.att_score, 4), "ctc": round(h.ctc_score, 4)} for h in hyps]
         if cfg.pinyin_mode == "ctc":
@@ -78,14 +82,16 @@ def decode_manifest(model: VallrPin, tok: DualTokenizer, cfg: DecodeConfig,
         records.append(rec)
 
         top1 = nbest[0]["text"] if nbest else ""
-        cer1.update(ref_chars, list(top1))
         ser.update(ref_py, pinyin)
-        if nbest:                                    # oracle：N-best 里最接近参考的那条
+        if nbest:
+            cer1.update(ref_chars, list(top1))
+            # oracle：N-best 里最接近参考的那条
             best = min((list(h["text"]) for h in nbest),
                        key=lambda cand: _quick_er(ref_chars, cand))
             cerO.update(ref_chars, best)
 
-    stats = {"cer_top1": cer1.rate, "cer_oracle": cerO.rate, "pinyin_ser": ser.rate,
+    stats = {"cer_top1": cer1.rate if cer1.total else None,
+             "cer_oracle": cerO.rate if cerO.total else None, "pinyin_ser": ser.rate,
              "n_utts": len(records)}
     if cfg.out_jsonl:
         os.makedirs(os.path.dirname(os.path.abspath(cfg.out_jsonl)), exist_ok=True)
@@ -94,10 +100,12 @@ def decode_manifest(model: VallrPin, tok: DualTokenizer, cfg: DecodeConfig,
                 f.write(json.dumps(r, ensure_ascii=False) + "\n")
         with open(cfg.out_jsonl.replace(".jsonl", ".stats.json"), "w", encoding="utf-8") as f:
             json.dump(stats, f, ensure_ascii=False, indent=2)
+    char_summary = (f"CER(top1)={100 * stats['cer_top1']:.2f}% "
+                    f"CER(oracle-{cfg.nbest}best)={100 * stats['cer_oracle']:.2f}% "
+                    if stats["cer_top1"] is not None
+                    and stats["cer_oracle"] is not None else "character head=disabled ")
     print(f"[decode{'/' + tag if tag else ''}] utts={stats['n_utts']} "
-          f"CER(top1)={100 * stats['cer_top1']:.2f}% "
-          f"CER(oracle-{cfg.nbest}best)={100 * stats['cer_oracle']:.2f}% "
-          f"pinyin SER={100 * stats['pinyin_ser']:.2f}%", flush=True)
+          f"{char_summary}pinyin SER={100 * stats['pinyin_ser']:.2f}%", flush=True)
     return records
 
 

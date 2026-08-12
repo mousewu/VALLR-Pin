@@ -1,0 +1,31 @@
+# Independent text-only data for Stage-II. Copy to stage2_text.local.yaml and
+# replace paths. Keep held-out VSR transcripts in exclude_paths to audit exact
+# sentence contamination.
+out_dir: data/stage2_text
+seed: 2026
+val_percent: 1
+test_percent: 1
+min_chars: 4
+max_chars: 80
+deduplicate: true
+exclude_paths:
+  - data/stage1/dev.jsonl
+  - data/stage1/test.jsonl
+
+sources:
+  - name: spoken_subtitles
+    path: /DATA/TEXT/subtitles.jsonl
+    format: jsonl
+    text_field: text
+    document_field: video_id
+
+  - name: interview_transcripts
+    path: /DATA/TEXT/interviews.txt
+    format: text
+
+  - name: encyclopedia
+    path: /DATA/TEXT/encyclopedia.tsv
+    format: delimited
+    delimiter: "\t"
+    text_column: 1
+    document_column: 0

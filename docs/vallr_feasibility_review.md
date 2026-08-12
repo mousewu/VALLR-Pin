@@ -6,10 +6,12 @@
 
 VALLR-Pin 因此采用以下修订：
 
-1. Stage-I 以无声调拼音 CTC 为主目标（90%），字符 CTC 仅作辅助正则和候选来源（10%）。
+1. Stage-I 主方案只训练无声调拼音 CTC；字符 CTC 仅作为独立基线或可选辅助消融。
 2. 每个视频帧保留一个时序特征；禁止把 VideoMAE 的空间 patch token 展平后称为“时间”。
-3. 使用 CTC prefix beam 同时生成拼音 N-best 和字符 N-best；不再使用两个自回归视觉解码器。
-4. Stage-II 接收拼音主假设/后续可扩展的拼音 lattice，以及低权重字符候选；LLM 只承担同音消歧和局部纠错。
+3. 使用 CTC prefix beam 生成拼音 N-best；只有字符头消融实验才额外生成字符 N-best，
+   不再使用两个自回归视觉解码器。
+4. Stage-II 用独立中文纯文本训练“带噪拼音→原文”，不依赖 Stage-I 检查点或字符候选；
+   真实 VSR 错误和字符候选只用于可选校准/重排实验。
 5. CTC 目标长于有效视频帧时立即报错，不再用 `zero_infinity=True` 静默吞掉无效样本。
 
 ## 对英文项目的代码与权重审查
@@ -51,12 +53,16 @@ VALLR-Pin 因此采用以下修订：
 mouth ROI (T,1,88,88)
   -> temporal-preserving 3D stem + 2D ResNet
   -> SANM encoder (T,D)
-  -> pinyin CTC (primary, 0.9) -> pinyin prefix beam / lattice
-  -> char CTC   (auxiliary, 0.1) -> low-weight text N-best
-  -> constrained Mandarin LM -> final characters
+  -> pinyin CTC -> pinyin prefix beam / lattice
+independent Mandarin text -> G2P -> online Pinyin noise -> LLM LoRA
+predicted pinyin -> constrained Mandarin LLM -> final characters
+
+optional ablation: shared encoder -> char CTC auxiliary head
 ```
 
-字符辅助头并非让视觉网络重新承担完整语言建模；它只提供与视觉后验相关的候选。核心验收指标必须分层报告：Stage-I 拼音 SER、字符辅助 CER、Stage-II 最终 CER，以及拼音 oracle/lattice recall。
+字符辅助头并非默认 Stage-II 接口，它只用于检查多任务监督是否改善视觉表示。
+核心验收指标必须分层报告：Stage-I 拼音 SER、拼音 oracle/lattice recall、Stage-II 最终 CER；
+字符 CER 仅在启用字符头的对照实验中报告。
 
 ## 可行性门槛
 

@@ -8,7 +8,9 @@ import numpy as np
 from vallr_pin.data.corpora import BuildConfig, CorpusSpec, build_manifests
 from vallr_pin.data.samplers import DistributedBucketBatchSampler
 from vallr_pin.engine.trainer import TrainConfig, Trainer
-from vallr_pin.models.vallr_pin import VallrPinConfig
+from vallr_pin.engine.decode import DecodeConfig, decode_manifest
+from vallr_pin.models.vallr_pin import VallrPin, VallrPinConfig
+from vallr_pin.text.tokenizer import DualTokenizer
 
 
 def _npy(path: Path, frames: int = 12):
@@ -28,9 +30,12 @@ def test_corpus_builder_speaker_split_and_pseudo_gate(tmp_path):
                       format="delimited", speaker_column=2, media_root="roi96",
                       media_glob="**/*.npy")
     out = tmp_path / "manifests"
-    report = build_manifests(BuildConfig(sources=[spec], out_dir=str(out),
+    disabled = CorpusSpec(name="future", root="/missing", annotation="missing.jsonl",
+                          enabled=False)
+    report = build_manifests(BuildConfig(sources=[spec, disabled], out_dir=str(out),
                                          dev_speaker_percent=25, test_speaker_percent=25))
     assert report["accepted"] == 12 and report["speaker_overlap"] == 0
+    assert report["rejected"]["future:source_disabled"] == 1
     split_speakers = {}
     for split in ("train", "dev", "test"):
         split_speakers[split] = {json.loads(line)["speaker_id"] for line in
@@ -75,3 +80,23 @@ def test_trainer_checkpoint_resume(tmp_path):
     assert resumed.start_epoch == 2 and resumed.step > 0
     resumed.fit()
     assert (out / "ckpts" / "ckpt_ep2.pt").exists()
+
+
+def test_pinyin_only_decode_does_not_use_untrained_character_head(tmp_path):
+    text = "我的手机"
+    tok = DualTokenizer.build_from_texts([text])
+    cfg = VallrPinConfig(char_vocab_size=len(tok.char), pinyin_vocab_size=len(tok.pinyin),
+                         d_model=16, heads=2, ffn=32, enc_layers=1,
+                         frontend_width=4, sanm_kernel=3, alpha=0.0)
+    model = VallrPin(cfg)
+    video = tmp_path / "u.npy"; _npy(video, 16)
+    manifest = tmp_path / "manifest.jsonl"
+    manifest.write_text(json.dumps({"id": "u", "video": str(video), "text": text,
+                                    "n_frames": 16}, ensure_ascii=False) + "\n")
+    output = tmp_path / "decode.jsonl"
+    rows = decode_manifest(model, tok, DecodeConfig(
+        manifest=str(manifest), out_jsonl=str(output), beam=2, nbest=2,
+        crop_size=32, device="cpu"))
+    assert rows[0]["nbest"] == [] and rows[0]["pinyin_nbest"]
+    stats = json.loads((tmp_path / "decode.stats.json").read_text())
+    assert stats["cer_top1"] is None and stats["cer_oracle"] is None
