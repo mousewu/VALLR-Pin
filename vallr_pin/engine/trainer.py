@@ -51,6 +51,8 @@ class TrainConfig:
     std: float = 0.165
     max_frames: int = 0               # never silently truncate; 0 means unlimited
     min_frames: int = 4
+    require_roi_metadata: bool = True # reject raw_scene / face_crop / legacy manifests
+    expected_fps: float = 25.0
     device: str = "auto"
     amp: bool = True
     compile: bool = False
@@ -173,7 +175,9 @@ class Trainer:
                            time_mask=self.cfg.time_mask if train else 0,
                            mean=self.cfg.mean, std=self.cfg.std),
             root=self.cfg.data_root, max_frames=self.cfg.max_frames,
-            min_frames=self.cfg.min_frames)
+            min_frames=self.cfg.min_frames,
+            require_mouth_roi=self.cfg.require_roi_metadata,
+            expected_fps=self.cfg.expected_fps)
 
     def _train_loader(self):
         from ..data.dataset import collate

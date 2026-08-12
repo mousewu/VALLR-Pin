@@ -87,7 +87,11 @@ def build(args) -> dict:
                     "pinyin": " ".join(row["syls"]), "n_frames": len(arr),
                     "start": row["cue"].start, "end": row["cue"].end,
                     "source_id": args.source_id, "speaker_id": args.speaker_id,
-                    "spec": spec.name}
+                    "spec": spec.name, "source_input_type": "raw_scene",
+                    "input_type": "mouth_roi", "roi_type": "mouth",
+                    "roi_spec": spec.name, "fps": float(fps),
+                    "roi_height": int(arr.shape[1]), "roi_width": int(arr.shape[2]),
+                    "roi_channels": (1 if arr.ndim == 3 else int(arr.shape[3]))}
             # URI 相对 out_dir，DataLoader(root=out_dir) 可直接读取。
             uri = writer.write(key, arr, meta)
             meta["video"] = "wds://shards/" + uri.split("wds://", 1)[1]

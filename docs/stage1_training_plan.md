@@ -47,29 +47,52 @@ python scripts/build_stage1_manifests.py configs/corpora.local.yaml
 输出记录至少包含：
 
 ```json
-{"id":"cn_cvs:utt1","video":"/abs/utt1.npy","text":"今天天气很好","speaker_id":"cn_cvs:spk1","source":"cn_cvs","split":"train","n_frames":42}
+{"id":"cn_cvs:utt1","video":"/abs/utt1.mp4","text":"今天天气很好","speaker_id":"cn_cvs:spk1","source":"cn_cvs","split":"train","input_type":"face_crop"}
 ```
+
+`input_type` 必须按发布包的实际空间格式填写，不能由扩展名或分辨率猜测：
+
+- `raw_scene`：CMLR 一类保留人物半身和背景的原始画面；
+- `face_crop`：CN-CVS 一类已经裁到人脸、但尚未裁嘴的画面；
+- `mouth_roi`：已经是固定规格嘴部 ROI 的 `.npy`，还必须提供 `fps`、
+  `roi_height`、`roi_width` 和 `roi_type: mouth`。
 
 如果同一公众人物可能同时出现在 CN-CVS 与 CNC-AV，需先用人脸 embedding 聚类得到跨库
 `global_speaker_id`，写回 JSONL。仅给 speaker 加数据集前缀无法阻止跨库身份泄漏。
 
 ## 4. ROI 预处理
 
-如果拿到的是原始视频，先让 manifest 指向视频，再批量产生轨迹和 ROI：
+先让 manifest 指向数据集发布的视频，再批量产生轨迹和 ROI：
 
 ```bash
 python scripts/preprocess_stage1_roi.py data/stage1/train.jsonl \
   --out-manifest data/stage1/train.roi.jsonl \
   --out-root /DATA/VALLR_PIN_DERIVED \
-  --face-model models/face_landmarker.task --workers 8 --min-coverage 0.95
+  --face-model models/face_landmarker.task --workers 8 --min-coverage 0.95 \
+  --target-fps 25
 ```
 
-同样处理 dev/test。轨迹默认保留，后续修改 ROI 几何无需重新做人脸检测。不要用
+同样处理 dev/test。脚本根据 `input_type` 自动采用不同路径：
+
+- CMLR `raw_scene`：最多检测 5 张脸，先做跨帧身份关联，再结合覆盖率、归一化口型运动、
+  人脸尺寸和画面位置选择说话轨迹；多脸得分差小于 0.05 的歧义样本默认拒绝；
+- CN-CVS `face_crop`：只定位裁剪画面中的主脸，再根据嘴唇关键点裁成嘴部 ROI；
+- 两者最终都输出 `25fps × 96×96 × gray`，manifest 改写为
+  `input_type: mouth_roi, roi_type: mouth`，训练时再随机裁到 88×88。
+
+默认要求原始画面的唇宽中位数至少 12px（`--min-lip-width-px`），并把
+`median_lip_width_px` 和 `median_yaw_proxy` 写入 manifest；建议先看报告分布和抽检图，再决定
+是否启用 `--max-yaw-proxy`，不要未经数据统计直接用侧脸阈值大量删样本。
+
+自动选择错误时，在原始 manifest 对对应样本增加 `"face_track_id": 轨迹编号` 后重跑。
+ROI 输出路径包含选择策略和轨迹编号，因此人工修正不会误复用旧缓存。轨迹默认保留，后续修改
+ROI 几何无需重新做人脸检测。不要用
 `prepare_manifest.py` 的“下半脸中心粗裁”跑正式实验；正式数据必须使用关键点稳定的嘴部裁剪。
 
 关键质量门：
 
 - 固定 25fps，不能对整句稀疏抽 16 帧；
+- Stage-I 默认拒绝 `raw_scene`、`face_crop`、缺少 ROI 元数据以及非 25fps manifest；
 - ROI 检出覆盖率至少 95%；
 - 字幕必须对应完整 clip，不允许只截视频而不截标签；
 - `frames >= labels + adjacent_repeat(labels)`；

@@ -197,7 +197,9 @@ vallr_pin/
 │   └── refine.py          LLM 精化器、n-gram 受限重打分器、批量评测入口
 └── cli.py                 train / decode / build-stage2-text / sft / refine / pipeline
 configs/  cnvsrc_base.yaml（论文规格）· smoke.yaml（小规模）· llm_sft.yaml
-scripts/  prepare_manifest.py（CNVSRC/CMLR→manifest+ROI）· run_full_pipeline.sh
+scripts/  build_stage1_manifests.py（异构标注→原始 manifest）
+          preprocess_stage1_roi.py（raw_scene/face_crop→统一嘴部 ROI）
+          run_full_pipeline.sh
 tests/    test_pipeline_units.py
 ```
 
@@ -218,7 +220,14 @@ python tests/test_pipeline_units.py          # 单元测试，不需要 GPU/数�
 ```bash
 cp configs/corpora.example.yaml configs/corpora.local.yaml
 python scripts/build_stage1_manifests.py configs/corpora.local.yaml
-python scripts/audit_stage1_data.py data/stage1/{train,dev,test}.jsonl --out data/stage1/audit.json
+for split in train dev test; do
+  python scripts/preprocess_stage1_roi.py data/stage1/${split}.jsonl \
+    --out-manifest data/stage1/${split}.roi.jsonl \
+    --out-root /DATA/VALLR_PIN_DERIVED \
+    --face-model models/face_landmarker.task --workers 8
+done
+python scripts/audit_stage1_data.py data/stage1/{train,dev,test}.roi.jsonl \
+  --out data/stage1/audit.json
 torchrun --standalone --nproc_per_node=8 -m vallr_pin.cli train \
   --config configs/stage1_pinyin_only.yaml
 ```
@@ -327,7 +336,13 @@ k-gram 锚点、取单调子序列、块内 DP，最后按句统计匹配率，�
 #    CNVSRC.Dev、CN-CVS2-P1、CN-CVS3 等其他有句级文本的来源。
 cp configs/corpora.example.yaml configs/corpora.local.yaml
 python scripts/build_stage1_manifests.py configs/corpora.local.yaml
-python scripts/audit_stage1_data.py data/stage1/{train,dev,test}.jsonl \
+for split in train dev test; do
+  python scripts/preprocess_stage1_roi.py data/stage1/${split}.jsonl \
+    --out-manifest data/stage1/${split}.roi.jsonl \
+    --out-root /DATA/VALLR_PIN_DERIVED \
+    --face-model models/face_landmarker.task --workers 8
+done
+python scripts/audit_stage1_data.py data/stage1/{train,dev,test}.roi.jsonl \
   --out data/stage1/audit.json
 
 # 2) 视频和纯文本两阶段解耦训练

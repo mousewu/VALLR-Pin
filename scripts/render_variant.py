@@ -97,7 +97,13 @@ def render(video: str, track_path: str, spec, out_path: str,
     np.save(out_path, arr)
     info = {"out": out_path, "shape": list(arr.shape), "dtype": str(arr.dtype),
             "spec": spec.to_dict(), "resampled": resampled,
-            "src_fps": track.fps, "missing_frames": missing, "coverage": coverage,
+            "src_fps": track.fps, "target_fps": float(spec.fps or track.fps),
+            "missing_frames": missing, "coverage": coverage,
+            "track_meta": {key: track.meta[key] for key in
+                           ("input_type", "selection_strategy", "selected_track_id",
+                            "selection_margin", "face_track_count",
+                            "median_lip_width_px", "median_yaw_proxy")
+                           if key in track.meta},
             "mb": round(arr.nbytes / 1e6, 1)}
     with open(out_path.replace(".npy", ".spec.json"), "w", encoding="utf-8") as f:
         json.dump(info, f, ensure_ascii=False, indent=2)

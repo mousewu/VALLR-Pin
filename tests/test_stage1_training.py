@@ -20,6 +20,12 @@ def _npy(path: Path, frames: int = 12):
     np.save(path, np.random.default_rng(0).integers(0, 255, (frames, 32, 32), dtype=np.uint8))
 
 
+def _roi_fields(size: int = 32) -> dict:
+    return {"input_type": "mouth_roi", "source_input_type": "face_crop",
+            "roi_type": "mouth", "roi_spec": "test", "fps": 25.0,
+            "roi_height": size, "roi_width": size, "roi_channels": 1}
+
+
 def test_corpus_builder_speaker_split_and_pseudo_gate(tmp_path):
     root = tmp_path / "corpus"; media = root / "roi96"; rows = []
     for speaker in range(12):
@@ -43,6 +49,8 @@ def test_corpus_builder_speaker_split_and_pseudo_gate(tmp_path):
         split_speakers[split] = {json.loads(line)["speaker_id"] for line in
                                  (out / f"{split}.jsonl").read_text().splitlines()}
     assert not split_speakers["train"] & split_speakers["dev"]
+    row = json.loads(next(line for line in (out / "train.jsonl").read_text().splitlines()))
+    assert row["input_type"] == "mouth_roi" and row["roi_type"] == "mouth"
 
 
 def test_distributed_bucket_sampler_is_deterministic_and_sharded():
@@ -63,7 +71,8 @@ def test_trainer_checkpoint_resume(tmp_path):
     for index, text in enumerate(["今天天气", "明天上班", "我们学习", "大家回家", "天气不错", "继续训练"]):
         path = data / f"u{index}.npy"; _npy(path, 16)
         items.append({"id": f"u{index}", "video": str(path), "text": text,
-                      "speaker_id": f"s{index}", "source": "toy", "n_frames": 16})
+                      "speaker_id": f"s{index}", "source": "toy", "n_frames": 16,
+                      **_roi_fields()})
     train, dev = tmp_path / "train.jsonl", tmp_path / "dev.jsonl"
     train.write_text("".join(json.dumps(x, ensure_ascii=False) + "\n" for x in items[:4]))
     dev.write_text("".join(json.dumps(x, ensure_ascii=False) + "\n" for x in items[4:]))
@@ -98,7 +107,8 @@ def test_pinyin_only_decode_does_not_use_untrained_character_head(tmp_path):
     video = tmp_path / "u.npy"; _npy(video, 16)
     manifest = tmp_path / "manifest.jsonl"
     manifest.write_text(json.dumps({"id": "u", "video": str(video), "text": text,
-                                    "n_frames": 16}, ensure_ascii=False) + "\n")
+                                    "n_frames": 16, **_roi_fields()},
+                                   ensure_ascii=False) + "\n")
     output = tmp_path / "decode.jsonl"
     rows = decode_manifest(model, tok, DecodeConfig(
         manifest=str(manifest), out_jsonl=str(output), beam=2, nbest=2,
@@ -119,7 +129,8 @@ def test_text_only_decode_does_not_use_untrained_pinyin_head(tmp_path):
     video = tmp_path / "u.npy"; _npy(video, 16)
     manifest = tmp_path / "manifest.jsonl"
     manifest.write_text(json.dumps({"id": "u", "video": str(video), "text": text,
-                                    "n_frames": 16}, ensure_ascii=False) + "\n")
+                                    "n_frames": 16, **_roi_fields()},
+                                   ensure_ascii=False) + "\n")
     output = tmp_path / "decode.jsonl"
     rows = decode_manifest(model, tok, DecodeConfig(
         manifest=str(manifest), out_jsonl=str(output), beam=2, nbest=2,
@@ -149,3 +160,30 @@ def test_explicit_ctc_weights_train_only_requested_heads():
 
     with pytest.raises(ValueError, match="must be set together"):
         VallrPinConfig(text_ctc_weight=1.0).ctc_weights()
+
+
+def test_dataset_rejects_raw_scene_before_training(tmp_path):
+    from vallr_pin.data.dataset import LipReadingDataset, VideoTransform
+
+    video = tmp_path / "raw.npy"; _npy(video)
+    manifest = tmp_path / "raw.jsonl"
+    manifest.write_text(json.dumps({"id": "raw", "video": str(video),
+                                    "text": "今天天气", "input_type": "raw_scene"},
+                                   ensure_ascii=False) + "\n")
+    tok = DualTokenizer.build_from_texts(["今天天气"])
+    with pytest.raises(ValueError, match="requires input_type=mouth_roi"):
+        LipReadingDataset(str(manifest), tok, VideoTransform(crop_size=32))
+
+
+def test_existing_mouth_roi_is_validated_without_face_detection(tmp_path):
+    from scripts.preprocess_stage1_roi import process
+
+    roi = tmp_path / "roi.npy"
+    np.save(roi, np.zeros((10, 96, 96), dtype=np.uint8))
+    item = {"id": "u", "video": str(roi), "text": "今天天气", "source": "toy",
+            "input_type": "mouth_roi", "source_input_type": "face_crop",
+            "roi_type": "mouth", "fps": 25.0}
+    output, report = process(item, str(tmp_path / "out"), "unused.task", .95,
+                             True, 25.0, 5, "active", .05, 1, 12.0, 0.0, "")
+    assert report["status"] == "ok" and output["roi_width"] == 96
+    assert output["source_input_type"] == "face_crop"

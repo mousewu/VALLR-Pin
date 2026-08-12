@@ -23,18 +23,27 @@ data/
 
 ## manifest 格式
 
-每行一条样本，可直接喂给 `python -m vallr_pin.cli train`：
+每行一条已经完成 ROI 预处理的样本，可直接喂给 `python -m vallr_pin.cli train`：
 
 ```json
 {"id": "utt_00129", "video": "roi/utt_00129.npy",
  "text": "舍弃一些东西可以换来更多其他的东西",
  "pinyin": "she qi yi xie dong xi ke yi huan lai geng duo qi ta de dong xi",
- "start": 299.77, "end": 302.37, "n_frames": 74, "frames_per_unit": 4.35}
+ "start": 299.77, "end": 302.37, "n_frames": 74, "frames_per_unit": 4.35,
+ "source_input_type": "raw_scene", "input_type": "mouth_roi", "roi_type": "mouth",
+ "fps": 25.0, "roi_height": 96, "roi_width": 96, "roi_channels": 1}
 ```
 
 `video` 是相对 `data/mono_demo/` 的路径；训练时用 `data_root` 指向该目录。
 `pinyin` 字段仅供人工检查，训练时由 `vallr_pin.text` 从 `text` 现场生成，
 两者应当一致。
+
+## CMLR 与 CN-CVS 的输入差异
+
+Stage-I 不直接读取原始 CMLR/CN-CVS 视频。先在 corpus 配置中将 CMLR 标为
+`input_type: raw_scene`、CN-CVS 标为 `input_type: face_crop`，构建原始 manifest 后运行
+`scripts/preprocess_stage1_roi.py`。训练配置只应指向 `*.roi.jsonl`；训练器会拒绝没有
+`input_type: mouth_roi`、`roi_type: mouth`、固定帧率和 ROI 尺寸元数据的记录。
 
 ## reports/ 里的关键结论
 

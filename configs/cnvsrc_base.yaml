@@ -1,7 +1,7 @@
 # Stage-I 训练配置：对标论文在 CNVSRC 固定赛道 (S3) 上的设置。
-# 数据请先转成 manifest jsonl（见 scripts/prepare_manifest.py）。
-train_manifest: data/cnvsrc/train.jsonl
-dev_manifest: data/cnvsrc/multi_dev.jsonl
+# 数据先构建原始 manifest，再用 scripts/preprocess_stage1_roi.py 统一成 ROI manifest。
+train_manifest: data/cnvsrc/train.roi.jsonl
+dev_manifest: data/cnvsrc/multi_dev.roi.jsonl
 data_root: data/cnvsrc
 out_dir: exp/vallr_pin_cnvsrc
 
@@ -14,6 +14,8 @@ weight_decay: 0.01
 grad_clip: 5.0
 num_workers: 8
 crop_size: 88
+require_roi_metadata: true
+expected_fps: 25.0
 time_mask: 4             # 时域随机遮蔽，缓解多说话人过拟合
 device: auto
 amp: true

@@ -59,7 +59,9 @@ class ROISpec:
 PRESETS: Dict[str, ROISpec] = {
     "vallr_pin": ROISpec(
         name="vallr_pin", size=96, color="gray", anchor="lips", scale=1.6,
-        note="存 96 训 88，多出的余量给随机裁剪；归一化放在 VideoTransform 里做"),
+        fps=25,
+        note="统一到 25fps，存 96 训 88，多出的余量给随机裁剪；"
+             "归一化放在 VideoTransform 里做"),
     "syncnet": ROISpec(
         name="syncnet", size=224, color="bgr", anchor="face", scale=1.4, y_shift=0.4,
         fps=25,
@@ -77,6 +79,7 @@ PRESETS: Dict[str, ROISpec] = {
         note="Auto-AVSR 风格：双眼/鼻尖/嘴角五点相似变换，输出 96px 灰度"),
     "cnvsrc_baseline": ROISpec(
         name="cnvsrc_baseline", size=96, color="gray", anchor="lips", scale=1.5,
+        fps=25,
         note="CNVSRC baseline 的口部 ROI，训练时随机裁到 88"),
 }
 

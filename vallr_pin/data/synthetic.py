@@ -105,7 +105,11 @@ def build_synthetic_dataset(out_dir: str, n_train_speakers: int = 6,
                 name = f"{split}_spk{spk}_{si:04d}.npy"
                 np.save(os.path.join(vdir, name), arr)
                 items.append({"id": name[:-4], "video": os.path.join(split, name),
-                              "text": sent})
+                              "text": sent, "source": "synthetic",
+                              "input_type": "mouth_roi", "source_input_type": "synthetic",
+                              "roi_type": "mouth", "roi_spec": "synthetic",
+                              "fps": 25.0, "roi_height": size, "roi_width": size,
+                              "roi_channels": 1, "n_frames": int(arr.shape[0])})
         path = os.path.join(out_dir, f"{split}.jsonl")
         write_manifest(path, items)
         return path

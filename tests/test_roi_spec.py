@@ -154,6 +154,27 @@ def test_presets_are_self_consistent():
             assert spec.dtype == "float32", f"{name}: render 级归一化必须存 float32"
         if spec.normalize and spec.normalize_at == "load":
             assert spec.dtype == "uint8", f"{name}: load 级归一化应存 uint8 以省体积"
+    assert PRESETS["vallr_pin"].fps == 25
+
+
+def test_active_face_selection_tracks_identity_and_mouth_motion():
+    from scripts.extract_tracks import associate_face_detections, select_face_track
+
+    detections = []
+    for frame in range(12):
+        active = fake_landmarks(cx=350, cy=300, face_half=80)
+        quiet = fake_landmarks(cx=900, cy=300, face_half=105)
+        opening = 3.0 if frame % 2 else 22.0
+        active[13] = [350, 345 - opening / 2]
+        active[14] = [350, 345 + opening / 2]
+        quiet[13], quiet[14] = [900, 340], [900, 344]
+        # Detection order changes, so selecting face_landmarks[0] would switch identity.
+        detections.append((frame, [active, quiet] if frame % 2 else [quiet, active]))
+    tracks = associate_face_detections(detections)
+    selected, scores, margin = select_face_track(tracks, 12, 1280, 720, "active")
+    center_x = np.median([row["center"][0] for row in selected["geometry"]])
+    assert len(tracks) == 2 and center_x < 500
+    assert scores[0]["motion_score"] == 1.0 and margin > 0
 
 
 if __name__ == "__main__":

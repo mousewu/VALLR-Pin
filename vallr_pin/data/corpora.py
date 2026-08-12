@@ -49,6 +49,14 @@ class CorpusSpec:
     text_prefix: str = "Text:"
     supervision: str = "supervised"  # supervised | pseudo
     pseudo_confidence: float = 1.0
+    # Spatial form of the media referenced by this source.  Keeping this in the
+    # manifest prevents a full news frame or a face crop from being silently
+    # treated as a model-ready mouth ROI.
+    input_type: str = "mouth_roi"     # raw_scene | face_crop | mouth_roi
+    # Required description for a source that already ships model-ready mouth
+    # arrays. Raw/face-crop inputs get these values from ROI preprocessing.
+    fps: float = 25.0
+    roi_spec: str = "external"
 
 
 @dataclass
@@ -226,6 +234,20 @@ def _n_frames(path: str) -> int:
     return 0
 
 
+def _roi_geometry(path: str) -> tuple[int, int, int] | None:
+    if not path.endswith(".npy"):
+        return None
+    try:
+        shape = np.load(path, mmap_mode="r").shape
+    except Exception:
+        return None
+    if len(shape) == 3:
+        return int(shape[1]), int(shape[2]), 1
+    if len(shape) == 4 and shape[-1] in (1, 3):
+        return int(shape[1]), int(shape[2]), int(shape[3])
+    return None
+
+
 def build_manifests(cfg: BuildConfig) -> dict:
     """Build train/dev/test manifests and a machine-readable rejection report."""
     os.makedirs(cfg.out_dir, exist_ok=True)
@@ -240,6 +262,9 @@ def build_manifests(cfg: BuildConfig) -> dict:
         if spec.supervision not in {"supervised", "pseudo"}:
             raise ValueError(
                 f"{spec.name}: supervision must be supervised or pseudo for CTC training")
+        if spec.input_type not in {"raw_scene", "face_crop", "mouth_roi"}:
+            raise ValueError(
+                f"{spec.name}: input_type must be raw_scene, face_crop or mouth_roi")
         if spec.supervision == "pseudo" and not cfg.allow_pseudo:
             rejected[f"{spec.name}:pseudo_disabled"] += 1
             continue
@@ -273,6 +298,14 @@ def build_manifests(cfg: BuildConfig) -> dict:
                 split = _split(speaker_key, cfg.seed,
                                cfg.dev_speaker_percent, cfg.test_speaker_percent)
             frames = _n_frames(media)
+            roi_geometry = _roi_geometry(media) if spec.input_type == "mouth_roi" else None
+            if spec.input_type == "mouth_roi":
+                if roi_geometry is None:
+                    rejected[f"{spec.name}:invalid_mouth_roi"] += 1; continue
+                if spec.fps <= 0:
+                    rejected[f"{spec.name}:missing_roi_fps"] += 1; continue
+                if roi_geometry[0] != roi_geometry[1] or roi_geometry[2] != 1:
+                    rejected[f"{spec.name}:invalid_mouth_roi_geometry"] += 1; continue
             _, syllables, unknown = text_to_pinyin_mixed(text)
             if unknown or not syllables:
                 rejected[f"{spec.name}:pinyin_unknown"] += 1; continue
@@ -281,6 +314,15 @@ def build_manifests(cfg: BuildConfig) -> dict:
             accepted.append({"id": unique_id, "video": media, "text": text,
                              "speaker_id": speaker_key, "source": spec.name,
                              "split": split, "n_frames": frames,
+                             "input_type": spec.input_type,
+                             "source_input_type": spec.input_type,
+                             "roi_type": ("mouth" if spec.input_type == "mouth_roi"
+                                          else ""),
+                             **({"roi_spec": spec.roi_spec, "fps": float(spec.fps),
+                                "roi_height": roi_geometry[0],
+                                "roi_width": roi_geometry[1],
+                                "roi_channels": roi_geometry[2]}
+                               if roi_geometry is not None else {}),
                              "supervision": spec.supervision,
                              "confidence": confidence})
             speakers_by_split[split].add(speaker_key)

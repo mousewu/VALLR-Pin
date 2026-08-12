@@ -204,7 +204,11 @@ def build(args) -> Dict:
         items.append({"id": name[:-4], "video": os.path.join("roi", name),
                       "text": "".join(toks), "pinyin": " ".join(syls),
                       "start": round(c.start, 2), "end": round(c.end, 2),
-                      "n_frames": len(arr), "frames_per_unit": round(len(arr) / len(toks), 2)})
+                      "n_frames": len(arr), "frames_per_unit": round(len(arr) / len(toks), 2),
+                      "source_input_type": "raw_scene", "input_type": "mouth_roi",
+                      "roi_type": "mouth", "roi_spec": "legacy_subtitle_builder",
+                      "fps": float(fps), "roi_height": int(arr.shape[1]),
+                      "roi_width": int(arr.shape[2]), "roi_channels": 1})
 
     mpath = os.path.join(args.out_dir, "manifest.jsonl")
     with open(mpath, "w", encoding="utf-8") as f:

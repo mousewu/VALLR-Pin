@@ -1,6 +1,6 @@
 # Text-head baseline: visual encoder -> character/token CTC.
-train_manifest: data/stage1/train.jsonl
-dev_manifest: data/stage1/dev.jsonl
+train_manifest: data/stage1/train.roi.jsonl
+dev_manifest: data/stage1/dev.roi.jsonl
 data_root: ""
 out_dir: exp/stage1_char_only
 epochs: 50
@@ -21,6 +21,8 @@ mean: 0.421
 std: 0.165
 max_frames: 0
 min_frames: 4
+require_roi_metadata: true
+expected_fps: 25.0
 device: auto
 amp: true
 compile: false

@@ -32,6 +32,8 @@ class DecodeConfig:
     device: str = "auto"
     max_utts: Optional[int] = None
     num_workers: int = 0
+    require_roi_metadata: bool = True
+    expected_fps: float = 25.0
     include_char_hypotheses: Optional[bool] = None  # auto: only when trained
     include_pinyin_hypotheses: Optional[bool] = None  # auto: only when trained
 
@@ -50,7 +52,9 @@ def decode_manifest(model: VallrPin, tok: DualTokenizer, cfg: DecodeConfig,
     device = resolve_device(cfg.device)
     model = model.to(device).eval()
     ds = LipReadingDataset(cfg.manifest, tok, VideoTransform(cfg.crop_size, train=False),
-                           root=cfg.data_root)
+                           root=cfg.data_root,
+                           require_mouth_roi=cfg.require_roi_metadata,
+                           expected_fps=cfg.expected_fps)
     loader = DataLoader(ds, batch_size=1, shuffle=False, num_workers=cfg.num_workers,
                         collate_fn=collate)
     use_chars = _use_head(cfg.include_char_hypotheses,

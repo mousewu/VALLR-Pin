@@ -18,10 +18,13 @@ from vallr_pin.data.dataset import read_manifest  # noqa: E402
 from vallr_pin.text.pinyin import text_to_pinyin_mixed  # noqa: E402
 
 
-def audit(paths: list[str], pixel_samples: int = 2000, seed: int = 0) -> dict:
+def audit(paths: list[str], pixel_samples: int = 2000, seed: int = 0,
+          expected_fps: float = 25.0) -> dict:
     splits, speakers, sources = {}, defaultdict(set), Counter()
+    input_types = Counter()
+    source_lip_widths, source_yaw_proxies = defaultdict(list), defaultdict(list)
     ids, media, problems = set(), set(), Counter()
-    lengths, ratios, rows = [], [], []
+    lengths, ratios, lip_widths, yaw_proxies, rows = [], [], [], [], []
     for path in paths:
         split = os.path.basename(path).split(".")[0]
         splits[split] = 0
@@ -30,7 +33,18 @@ def audit(paths: list[str], pixel_samples: int = 2000, seed: int = 0) -> dict:
             uid, video, text = item.get("id", ""), item.get("video", ""), item.get("text", "")
             if uid in ids: problems["duplicate_id"] += 1
             if video in media: problems["duplicate_media"] += 1
-            ids.add(uid); media.add(video); sources[f"{split}:{item.get('source','unknown')}"] += 1
+            source_name = item.get("source", "unknown")
+            ids.add(uid); media.add(video); sources[f"{split}:{source_name}"] += 1
+            input_types[f"{split}:{item.get('source_input_type', item.get('input_type','missing'))}"] += 1
+            if item.get("input_type") != "mouth_roi" or item.get("roi_type") != "mouth":
+                problems["not_mouth_roi"] += 1
+            try:
+                fps = float(item.get("fps", 0) or 0)
+                if fps <= 0: problems["missing_fps"] += 1
+                elif expected_fps > 0 and abs(fps - expected_fps) > .05:
+                    problems["wrong_fps"] += 1
+            except (TypeError, ValueError):
+                problems["bad_fps"] += 1
             speaker = item.get("speaker_id", "")
             if not speaker: problems["missing_speaker"] += 1
             else: speakers[split].add(speaker)
@@ -40,12 +54,27 @@ def audit(paths: list[str], pixel_samples: int = 2000, seed: int = 0) -> dict:
             if not tokens or not syllables: problems["empty_label"] += 1
             frames = int(item.get("n_frames", 0) or 0)
             if video.endswith(".npy") and os.path.exists(video):
-                try: frames = int(np.load(video, mmap_mode="r").shape[0])
+                try:
+                    shape = np.load(video, mmap_mode="r").shape
+                    frames = int(shape[0])
+                    if len(shape) not in (3, 4): problems["bad_roi_rank"] += 1
+                    else:
+                        height, width = int(shape[1]), int(shape[2])
+                        if height != width: problems["non_square_roi"] += 1
+                        declared = (int(item.get("roi_height", 0) or 0),
+                                    int(item.get("roi_width", 0) or 0))
+                        if declared != (height, width): problems["roi_shape_metadata"] += 1
                 except Exception: problems["bad_npy"] += 1
             if frames:
                 required = len(syllables) + sum(a == b for a, b in zip(syllables, syllables[1:]))
                 if frames < required: problems["invalid_ctc_length"] += 1
                 lengths.append(frames); ratios.append(frames / max(len(syllables), 1))
+            if item.get("median_lip_width_px") is not None:
+                lip_widths.append(float(item["median_lip_width_px"]))
+                source_lip_widths[source_name].append(float(item["median_lip_width_px"]))
+            if item.get("median_yaw_proxy") is not None:
+                yaw_proxies.append(float(item["median_yaw_proxy"]))
+                source_yaw_proxies[source_name].append(float(item["median_yaw_proxy"]))
 
     overlap = {}
     for left, right in (("train", "dev"), ("train", "test"), ("dev", "test")):
@@ -68,12 +97,30 @@ def audit(paths: list[str], pixel_samples: int = 2000, seed: int = 0) -> dict:
     std = (max(total_sq / pixels - mean * mean, 0.0) ** 0.5) if pixels else None
 
     percentile = lambda values, q: float(np.percentile(values, q)) if values else None
-    return {"splits": splits, "sources": dict(sources),
+    return {"splits": splits, "sources": dict(sources), "input_types": dict(input_types),
             "speakers": {k: len(v) for k, v in speakers.items()}, "speaker_overlap": overlap,
             "problems": dict(problems), "frames": {"p05": percentile(lengths, 5),
             "p50": percentile(lengths, 50), "p95": percentile(lengths, 95)},
             "frames_per_syllable": {"p05": percentile(ratios, 5),
             "p50": percentile(ratios, 50), "p95": percentile(ratios, 95)},
+            "visual_quality": {
+                "lip_width_px": {"p05": percentile(lip_widths, 5),
+                                  "p50": percentile(lip_widths, 50),
+                                  "p95": percentile(lip_widths, 95)},
+                "yaw_proxy": {"p05": percentile(yaw_proxies, 5),
+                              "p50": percentile(yaw_proxies, 50),
+                              "p95": percentile(yaw_proxies, 95)}},
+            "visual_quality_by_source": {
+                source: {
+                    "lip_width_px": {
+                        "p05": percentile(source_lip_widths[source], 5),
+                        "p50": percentile(source_lip_widths[source], 50),
+                        "p95": percentile(source_lip_widths[source], 95)},
+                    "yaw_proxy": {
+                        "p05": percentile(source_yaw_proxies[source], 5),
+                        "p50": percentile(source_yaw_proxies[source], 50),
+                        "p95": percentile(source_yaw_proxies[source], 95)}}
+                for source in sorted(set(source_lip_widths) | set(source_yaw_proxies))},
             "roi_normalization": {"mean": mean, "std": std,
                                   "sampled_utterances": len(candidates)}}
 
@@ -81,13 +128,19 @@ def audit(paths: list[str], pixel_samples: int = 2000, seed: int = 0) -> dict:
 def main() -> None:
     ap = argparse.ArgumentParser(); ap.add_argument("manifests", nargs="+")
     ap.add_argument("--pixel-samples", type=int, default=2000)
+    ap.add_argument("--expected-fps", type=float, default=25.0)
     ap.add_argument("--seed", type=int, default=0); ap.add_argument("--out", default="")
-    args = ap.parse_args(); report = audit(args.manifests, args.pixel_samples, args.seed)
+    args = ap.parse_args(); report = audit(
+        args.manifests, args.pixel_samples, args.seed, args.expected_fps)
     text = json.dumps(report, ensure_ascii=False, indent=2); print(text)
     if args.out:
         os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
         with open(args.out, "w", encoding="utf-8") as stream: stream.write(text + "\n")
-    if any(report["speaker_overlap"].values()) or report["problems"].get("invalid_ctc_length"):
+    fatal = {"speaker_leakage", "invalid_ctc_length", "not_mouth_roi", "missing_fps",
+             "wrong_fps", "bad_fps", "bad_roi_rank", "non_square_roi",
+             "roi_shape_metadata"}
+    if any(report["speaker_overlap"].values()) or any(
+            report["problems"].get(name) for name in fatal):
         raise SystemExit(2)
 
 

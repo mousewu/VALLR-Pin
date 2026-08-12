@@ -2,15 +2,17 @@
 
 manifest 为 jsonl，每行::
 
-    {"id": "utt_0001", "video": "/abs/or/rel/path.npy", "text": "今天可能会下雨"}
+    {"id": "utt_0001", "video": "/abs/or/rel/path.npy", "text": "今天可能会下雨",
+     "input_type": "mouth_roi", "roi_type": "mouth", "fps": 25,
+     "roi_height": 96, "roi_width": 96}
 
 ``video`` 支持三种形态：
   * ``.npy``  形如 (T,H,W) uint8 或 (T,H,W,3) 的已裁好唇部 ROI (推荐，读取最快)
   * 目录      内含按名字排序的帧图片 (需要 opencv)
-  * ``.mp4``  原始视频 (需要 opencv；实际训练建议离线裁好 ROI 存 npy)
+  * ``.mp4``  仅为兼容旧工具保留；Stage-I 默认拒绝直接训练原始视频
 
-CNVSRC / CMLR 的官方数据只要转成上面的 manifest 即可直接训练，
-`scripts/prepare_cnvsrc.py` 给了一个转换示例。
+CN-CVS 的人脸裁剪和 CMLR 的原始新闻画面都必须先经过
+``scripts/preprocess_stage1_roi.py``，统一成固定帧率的灰度嘴部 ROI。
 """
 
 from __future__ import annotations
@@ -75,6 +77,32 @@ def _load_video(path: str, root: str = "") -> np.ndarray:
     return arr.astype(np.uint8)
 
 
+def validate_roi_manifest(items: List[dict], expected_fps: float = 25.0) -> None:
+    """Fail fast when a training/decode manifest is not model-ready.
+
+    Shape is checked after loading in ``LipReadingDataset.__getitem__``; this
+    metadata-only pass is deliberately cheap enough to run on million-row
+    manifests before any DataLoader workers are started.
+    """
+    for index, item in enumerate(items):
+        uid = item.get("id", index)
+        if item.get("input_type") != "mouth_roi" or item.get("roi_type") != "mouth":
+            raise ValueError(
+                f"{uid}: Stage-I requires input_type=mouth_roi and roi_type=mouth; "
+                "run scripts/preprocess_stage1_roi.py first")
+        missing = [key for key in ("fps", "roi_height", "roi_width")
+                   if item.get(key) in (None, "")]
+        if missing:
+            raise ValueError(f"{uid}: ROI manifest is missing metadata: {', '.join(missing)}")
+        fps = float(item["fps"])
+        if expected_fps > 0 and abs(fps - expected_fps) > 0.05:
+            raise ValueError(
+                f"{uid}: ROI fps={fps:g}, expected {expected_fps:g}; re-run ROI preprocessing")
+        height, width = int(item["roi_height"]), int(item["roi_width"])
+        if height <= 0 or width <= 0 or height != width:
+            raise ValueError(f"{uid}: invalid mouth ROI geometry {height}x{width}")
+
+
 @dataclass
 class VideoTransform:
     crop_size: int = 88
@@ -108,12 +136,17 @@ class VideoTransform:
 class LipReadingDataset(Dataset):
     def __init__(self, manifest: str, tokenizer: DualTokenizer,
                  transform: Optional[VideoTransform] = None,
-                 root: str = "", max_frames: int = 0, min_frames: int = 4):
+                 root: str = "", max_frames: int = 0, min_frames: int = 4,
+                 require_mouth_roi: bool = True, expected_fps: float = 25.0):
         self.items = read_manifest(manifest)
         self.tok = tokenizer
         self.transform = transform or VideoTransform(train=False)
         self.root = root
         self.max_frames, self.min_frames = max_frames, min_frames
+        self.require_mouth_roi = require_mouth_roi
+        self.expected_fps = expected_fps
+        if require_mouth_roi:
+            validate_roi_manifest(self.items, expected_fps)
 
     def __len__(self) -> int:
         return len(self.items)
@@ -123,6 +156,19 @@ class LipReadingDataset(Dataset):
         raw = it["video"]
         path = raw if raw.startswith("wds://") or os.path.isabs(raw) else os.path.join(self.root, raw)
         video = _load_video(path, self.root)
+        if self.require_mouth_roi:
+            uid = it.get("id", idx)
+            _, height, width = video.shape
+            declared = (int(it["roi_height"]), int(it["roi_width"]))
+            if (height, width) != declared:
+                raise ValueError(
+                    f"{uid}: ROI array is {height}x{width}, manifest declares "
+                    f"{declared[0]}x{declared[1]}")
+            crop_size = self.transform.crop_size
+            if height != width or min(height, width) < crop_size:
+                raise ValueError(
+                    f"{uid}: mouth ROI {height}x{width} cannot provide a "
+                    f"{crop_size}x{crop_size} crop")
         if self.max_frames and len(video) > self.max_frames:
             raise ValueError(
                 f"{it.get('id', idx)} has {len(video)} frames > max_frames={self.max_frames}; "
