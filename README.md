@@ -73,7 +73,7 @@ X --F_VSR--> P̂ --F_LLM--> Y
 
 ---
 
-## 3. Stage-I：拼音-only CTC
+## 3. Stage-I：拼音/文字 CTC 可对比训练
 
 ### 3.1 视觉前端与编码器
 
@@ -89,7 +89,7 @@ X --F_VSR--> P̂ --F_LLM--> Y
 | 分支 | 结构 | 建模单元 | 作用 |
 |---|---|---|---|
 | 拼音主头 | 线性层 + CTC prefix beam | 无声调音节（约 410） | 学习视觉可辨的音节并产出 N-best |
-| 字符辅助头（可选） | 线性层 + CTC prefix beam | 汉字 | 仅用于消融或推理重排实验 |
+| 文字头 | 线性层 + CTC prefix beam | 汉字/整体英文 token | 可独立训练，或作为拼音头的辅助监督 |
 
 默认主方案损失为：
 
@@ -97,13 +97,21 @@ X --F_VSR--> P̂ --F_LLM--> Y
 L = L_ctc^pinyin
 ```
 
-`alpha=0.1` 的拼音+字符辅助和 `alpha=1.0` 的字符-only 仍用于公平消融，但不属于推理接口
-的必需部分。任何目标长度超过有效视频帧数的样本都会立即报错，避免 CTC 用零损失掩盖错误切段。
+三种模式由显式权重控制，总损失会按权重和归一化：
+
+```text
+Pinyin-only: text_ctc_weight=0.0, pinyin_ctc_weight=1.0
+Text-only:   text_ctc_weight=1.0, pinyin_ctc_weight=0.0
+Joint:       text_ctc_weight=0.1, pinyin_ctc_weight=0.9
+```
+
+任何目标长度超过有效视频帧数的样本都会立即报错，避免 CTC 用零损失掩盖错误切段。
+`alpha` 仅为旧配置兼容字段，新实验应使用上述两个权重。
 
 ### 3.3 N-best 与拼音假设
 
-- 拼音侧使用标准 **CTC prefix beam**。只有检查点实际训练过字符头时才解码字符候选；
-  `alpha=0` 不会运行随机初始化的字符头：
+- 两个头都使用标准 **CTC prefix beam**。解码器根据检查点中的权重自动启用已训练的头：
+  text-only 不会运行随机拼音头，pinyin-only 也不会运行随机文字头。
 
   ```
   score(Y) = log P_ctc(Y | X) / |Y|^lp
@@ -214,6 +222,15 @@ python scripts/audit_stage1_data.py data/stage1/{train,dev,test}.jsonl --out dat
 torchrun --standalone --nproc_per_node=8 -m vallr_pin.cli train \
   --config configs/stage1_pinyin_only.yaml
 ```
+
+一次顺序训练文字-only、拼音-only 和联合双头，并汇总最优 dev CER/SER：
+
+```bash
+GPUS=8 bash scripts/run_stage1_comparison.sh
+```
+
+每个实验的 `ckpts/` 会保存 `best.pt`（按 `selection_metric`），联合模式还会分别保存
+`best_cer.pt` 和 `best_ser.pt`，避免两个头在不同 epoch 达到最优时无法公平对比。
 
 如果 `CNC-AV` 指的是 `CN-Celeb-AV`，它在没有句级转写时不能作为监督 Stage-I 数据；
 默认 manifest 配置会关闭该 pseudo source。

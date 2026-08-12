@@ -5,6 +5,7 @@ out_dir: exp/stage1_pinyin_only
 epochs: 50
 batch_size: 8
 bucket_size: 40
+epoch_samples: 0
 # Empty means sample every source present in the manifest at its natural rate.
 # Set explicit probabilities only after all listed sources are actually present.
 source_weights: {}
@@ -16,8 +17,21 @@ grad_clip: 5.0
 num_workers: 8
 crop_size: 88
 time_mask: 4
+flip_prob: 0.5
+mean: 0.421
+std: 0.165
+max_frames: 0
+min_frames: 4
+device: auto
 amp: true
+compile: false
+resume: ""
+save_every: 2
+keep_ckpts: 8
+eval_every: 1
 selection_metric: ser
+save_best_per_metric: true
+log_every: 50
 seed: 2026
 swanlab:
   enabled: false
@@ -34,5 +48,7 @@ model:
   dropout: 0.1
   frontend: resnet18
   frontend_width: 64
-  alpha: 0.0
+  in_channels: 1
+  text_ctc_weight: 0.0
+  pinyin_ctc_weight: 1.0
   architecture_version: 2

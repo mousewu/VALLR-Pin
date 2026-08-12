@@ -21,6 +21,7 @@ from torch.utils.data import DataLoader, Subset
 from ..data.dataset import LipReadingDataset, VideoTransform, read_manifest
 from ..data.samplers import DistributedBucketBatchSampler
 from ..models.vallr_pin import VallrPin, VallrPinConfig
+from ..text.pinyin import text_to_pinyin_mixed
 from ..text.tokenizer import DualTokenizer
 from .metrics import ErrorStats
 from .tracking import SwanLabConfig, SwanLabTracker
@@ -58,6 +59,7 @@ class TrainConfig:
     keep_ckpts: int = 8
     eval_every: int = 1
     selection_metric: str = "ser"     # pinyin-first default; "cer" for char-only ablation
+    save_best_per_metric: bool = True  # joint mode also writes best_cer.pt / best_ser.pt
     log_every: int = 50
     seed: int = 0
     model: VallrPinConfig = field(default_factory=VallrPinConfig)
@@ -127,12 +129,18 @@ class Trainer:
         self.tok = build_tokenizer(cfg, self.is_main)
         cfg.model.char_vocab_size = len(self.tok.char)
         cfg.model.pinyin_vocab_size = len(self.tok.pinyin)
+        if cfg.selection_metric not in {"cer", "ser"}:
+            raise ValueError("selection_metric must be cer or ser")
+        if cfg.selection_metric == "cer" and not cfg.model.uses_text_head:
+            raise ValueError("selection_metric=cer requires an enabled text CTC head")
+        if cfg.selection_metric == "ser" and not cfg.model.uses_pinyin_head:
+            raise ValueError("selection_metric=ser requires an enabled Pinyin CTC head")
 
         model: torch.nn.Module = VallrPin(cfg.model).to(self.device)
         if cfg.compile and hasattr(torch, "compile"):
             model = torch.compile(model)
         if self.world_size > 1:
-            endpoints = cfg.model.alpha in (0.0, 1.0)
+            endpoints = not (cfg.model.uses_text_head and cfg.model.uses_pinyin_head)
             model = DistributedDataParallel(
                 model, device_ids=[self.local_rank] if self.device.type == "cuda" else None,
                 find_unused_parameters=endpoints)
@@ -142,6 +150,7 @@ class Trainer:
         self.use_amp = cfg.amp and self.device.type == "cuda"
         self.scaler = torch.amp.GradScaler("cuda", enabled=self.use_amp)
         self.step, self.start_epoch, self.best = 0, 1, float("inf")
+        self.best_by_metric = {"cer": float("inf"), "ser": float("inf")}
         self.train_loader, self.train_batch_sampler = self._train_loader()
         self.dev_loader = self._dev_loader() if cfg.dev_manifest else None
         if cfg.resume:
@@ -231,8 +240,8 @@ class Trainer:
                     metric = eval_stats[self.cfg.selection_metric]
                     if metric is None:
                         raise ValueError(
-                            f"selection_metric={self.cfg.selection_metric} is disabled by alpha="
-                            f"{self.cfg.model.alpha}")
+                            f"selection_metric={self.cfg.selection_metric} is disabled in "
+                            f"head_mode={self.cfg.model.head_mode}")
                     if self.is_main:
                         cer_text = (f"{100*eval_stats['cer']:.2f}%"
                                     if eval_stats["cer"] is not None else "disabled")
@@ -241,11 +250,25 @@ class Trainer:
                         print(f"           dev char_CER={cer_text} pinyin_SER={ser_text}",
                               flush=True)
                         self._append_metrics(epoch, stats, eval_stats)
+                        if self.cfg.save_best_per_metric:
+                            for name in ("cer", "ser"):
+                                value = eval_stats[name]
+                                if value is not None and value < self.best_by_metric[name]:
+                                    self.best_by_metric[name] = value
+                                    save_stats = {k: v for k, v in eval_stats.items()
+                                                  if v is not None}
+                                    self._raw_model().save(
+                                        os.path.join(self.cfg.out_dir, "ckpts",
+                                                     f"best_{name}.pt"),
+                                        tokenizer_dir="vocab", epoch=epoch, step=self.step,
+                                        selection_metric=name, **save_stats)
                         if metric < self.best:
                             self.best = metric
                             save_stats = {k: v for k, v in eval_stats.items() if v is not None}
                             self._raw_model().save(best_path, tokenizer_dir="vocab", epoch=epoch,
-                                                   step=self.step, **save_stats)
+                                                   step=self.step,
+                                                   selection_metric=self.cfg.selection_metric,
+                                                   **save_stats)
                 if self.is_main:
                     metrics = {f"train/{k}": v for k, v in stats.items()}
                     metrics.update({f"dev/{k}": v for k, v in (eval_stats or {}).items()})
@@ -309,6 +332,7 @@ class Trainer:
     @torch.no_grad()
     def evaluate(self, max_batches: Optional[int] = None) -> Dict[str, float]:
         self.model.eval(); chars, pinyin = ErrorStats(), ErrorStats()
+        text_oov, text_tokens = 0, 0
         raw = self._raw_model()
         for index, batch in enumerate(self.dev_loader):
             if max_batches and index >= max_batches:
@@ -317,30 +341,32 @@ class Trainer:
             memory, mask = raw.encode(batch["video"], batch["video_lens"])
             lengths = mask.sum(-1)
             char_hyp = (raw.ctc_greedy(raw.char_ctc, memory, lengths)
-                        if self.cfg.model.alpha > 0.0 else None)
+                        if self.cfg.model.uses_text_head else None)
             py_hyp = (raw.ctc_greedy(raw.pinyin_ctc, memory, lengths)
-                      if self.cfg.model.alpha < 1.0 else None)
+                      if self.cfg.model.uses_pinyin_head else None)
             for row in range(len(batch["ids"])):
+                ref_c, ref_p, _ = text_to_pinyin_mixed(batch["texts"][row])
                 if char_hyp is not None:
-                    ref_c = self.tok.char.decode(
-                        batch["char_ids"][row, :batch["char_lens"][row]].tolist())
                     chars.update(ref_c, self.tok.char.decode(char_hyp[row]))
+                    text_oov += sum(token not in self.tok.char.unit2id for token in ref_c)
+                    text_tokens += len(ref_c)
                 if py_hyp is not None:
-                    ref_p = self.tok.pinyin.decode(
-                        batch["pinyin_ids"][row, :batch["pinyin_lens"][row]].tolist())
                     pinyin.update(ref_p, self.tok.pinyin.decode(py_hyp[row]))
         numbers = torch.tensor([chars.sub, chars.dele, chars.ins, chars.total,
-                                pinyin.sub, pinyin.dele, pinyin.ins, pinyin.total],
+                                pinyin.sub, pinyin.dele, pinyin.ins, pinyin.total,
+                                text_oov, text_tokens],
                                dtype=torch.long, device=self.device)
         if dist.is_initialized():
             dist.all_reduce(numbers)
         values = numbers.tolist()
         return {"cer": (sum(values[:3]) / max(values[3], 1)
-                        if self.cfg.model.alpha > 0.0 else None),
+                        if self.cfg.model.uses_text_head else None),
                 "ser": (sum(values[4:7]) / max(values[7], 1)
-                        if self.cfg.model.alpha < 1.0 else None),
+                        if self.cfg.model.uses_pinyin_head else None),
                 "char_sub": values[0], "char_del": values[1], "char_ins": values[2],
-                "pinyin_sub": values[4], "pinyin_del": values[5], "pinyin_ins": values[6]}
+                "pinyin_sub": values[4], "pinyin_del": values[5], "pinyin_ins": values[6],
+                "text_oov_rate": (values[8] / max(values[9], 1)
+                                  if self.cfg.model.uses_text_head else None)}
 
     def _append_metrics(self, epoch: int, train: dict, dev: dict) -> None:
         with open(os.path.join(self.cfg.out_dir, "metrics.jsonl"), "a", encoding="utf-8") as stream:
@@ -351,6 +377,7 @@ class Trainer:
         state = {"cfg": self.cfg.model.to_dict(), "state_dict": self._raw_model().state_dict(),
                  "optimizer": self.opt.state_dict(), "scaler": self.scaler.state_dict(),
                  "epoch": epoch, "step": self.step, "best": self.best,
+                 "best_by_metric": self.best_by_metric,
                  "torch_rng": torch.get_rng_state(), "numpy_rng": np.random.get_state(),
                  "python_rng": random.getstate()}
         path = os.path.join(self.cfg.out_dir, "ckpts", "last.pt")
@@ -365,6 +392,7 @@ class Trainer:
             self.scaler.load_state_dict(checkpoint.get("scaler", {}))
             self.start_epoch = int(checkpoint.get("epoch", 0)) + 1
             self.step = int(checkpoint.get("step", 0)); self.best = float(checkpoint.get("best", self.best))
+            self.best_by_metric.update(checkpoint.get("best_by_metric", {}))
             if "torch_rng" in checkpoint: torch.set_rng_state(checkpoint["torch_rng"].cpu())
             if "numpy_rng" in checkpoint: np.random.set_state(checkpoint["numpy_rng"])
             if "python_rng" in checkpoint: random.setstate(checkpoint["python_rng"])

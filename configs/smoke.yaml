@@ -29,5 +29,6 @@ model:
   frontend: resnet18
   frontend_width: 16
   lambda_ctc: 1.0
-  alpha: 0.1
+  text_ctc_weight: 0.1
+  pinyin_ctc_weight: 0.9
   architecture_version: 2

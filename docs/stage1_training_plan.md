@@ -3,13 +3,13 @@
 ## 1. 训练目标与对照实验
 
 第一轮不要使用 CNC-AV 伪标签。固定同一份 ROI、同一 speaker-independent 划分、同一视觉
-编码器和相同 optimizer steps，依次训练。Pinyin-CTC 是解耦主方案，其余两组是消融：
+编码器和相同 optimizer steps，依次训练。Pinyin-CTC 是解耦主方案，其余两组是对照：
 
-| 实验 | `alpha` | 最佳模型指标 | 目的 |
-|---|---:|---|---|
-| Char-CTC | 1.0 | dev CER | 直接汉字基线 |
-| Pinyin-CTC | 0.0 | dev SER | 检验音节中介本身 |
-| Pinyin + Char auxiliary | 0.1 | dev SER | 可选消融，检查字符辅助是否改善表示 |
+| 实验 | 文字权重 | 拼音权重 | 最佳模型指标 | 目的 |
+|---|---:|---:|---|---|
+| Text-CTC | 1.0 | 0.0 | dev CER | 直接文字基线 |
+| Pinyin-CTC | 0.0 | 1.0 | dev SER | 检验音节中介本身 |
+| Joint CTC | 0.1 | 0.9 | dev SER，同时保存最优 CER | 检查文字辅助是否改善共享表示 |
 
 模型约 53M 参数（字符表按 7k 估算，虽然 Pinyin-only 不反传字符头）。输入是连续 25fps、96×96 灰度嘴部 ROI，训练时随机裁
 88×88；前端和 SANM 都保持逐帧时间长度。Pinyin-only 必须报告无声调拼音 SER 及
@@ -120,7 +120,9 @@ torchrun --standalone --nproc_per_node=8 -m vallr_pin.cli train \
   --set resume=exp/stage1_pinyin_only/ckpts/last.pt
 ```
 
-`last.pt` 包含模型、optimizer、GradScaler、epoch、global step 和 RNG；`best.pt` 是轻量推理检查点。
+`last.pt` 包含模型、optimizer、GradScaler、epoch、global step 和 RNG；`best.pt` 按
+`selection_metric` 保存。启用文字头时另存 `best_cer.pt`，启用拼音头时另存
+`best_ser.pt`。
 
 ### 6.3 公平消融
 
@@ -128,6 +130,13 @@ torchrun --standalone --nproc_per_node=8 -m vallr_pin.cli train \
 torchrun --standalone --nproc_per_node=8 -m vallr_pin.cli train --config configs/stage1_char_only.yaml
 torchrun --standalone --nproc_per_node=8 -m vallr_pin.cli train --config configs/stage1_pinyin_only.yaml
 torchrun --standalone --nproc_per_node=8 -m vallr_pin.cli train --config configs/stage1_multicorpus.yaml
+```
+
+也可以用统一脚本串行启动三组实验，避免同一组 GPU 显存超订：
+
+```bash
+GPUS=8 bash scripts/run_stage1_comparison.sh
+python scripts/summarize_stage1_comparison.py
 ```
 
 至少使用 3 个 seed。若预算有限，先用相同 `epoch_samples` 做固定 step 的三组对比，而不是比较
@@ -141,7 +150,10 @@ torchrun --standalone --nproc_per_node=8 -m vallr_pin.cli train --config configs
 - 无 NaN/Inf、无被静默吞掉的 CTC 样本；
 - 长度分桶后的 padding 比随机 batching 明显降低；
 - 各来源实际抽样比例接近配置；
-- `last.pt` 和 `best.pt` 均可解码。
+- `last.pt`、`best.pt` 以及已启用头对应的 `best_cer.pt`/`best_ser.pt` 均可解码；
+- text-only 解码结果中 `pinyin_ser=null`，pinyin-only 结果中 `cer_top1=null`，禁止用未训练头产生随机分数；
+- CER 始终与原始文字 token 比较，不允许用编码后的 `<unk>` 替代参考字；同时报告
+  `text_oov_rate`，词表 OOV 过高时不应解读文字头 CER；
 
 研究验收：
 

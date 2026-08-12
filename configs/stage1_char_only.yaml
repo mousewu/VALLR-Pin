@@ -1,11 +1,13 @@
-# Ablation B: character CTC baseline under the identical visual encoder/budget.
+# Text-head baseline: visual encoder -> character/token CTC.
 train_manifest: data/stage1/train.jsonl
 dev_manifest: data/stage1/dev.jsonl
+data_root: ""
 out_dir: exp/stage1_char_only
 epochs: 50
 batch_size: 8
 bucket_size: 40
-source_weights: {cn_cvs: 0.70, cmlr: 0.30}
+epoch_samples: 0
+source_weights: {}
 accum_steps: 4
 lr: 5.0e-4
 warmup_steps: 10000
@@ -14,9 +16,28 @@ grad_clip: 5.0
 num_workers: 8
 crop_size: 88
 time_mask: 4
+flip_prob: 0.5
+mean: 0.421
+std: 0.165
+max_frames: 0
+min_frames: 4
+device: auto
 amp: true
+compile: false
+resume: ""
+save_every: 2
+keep_ckpts: 8
+eval_every: 1
 selection_metric: cer
+save_best_per_metric: true
+log_every: 50
 seed: 2026
+swanlab:
+  enabled: false
+  project: VALLR-Pin
+  experiment_name: stage1-text-only
+  mode: online
+  logdir: swanlog
 model:
   d_model: 512
   heads: 8
@@ -26,5 +47,7 @@ model:
   dropout: 0.1
   frontend: resnet18
   frontend_width: 64
-  alpha: 1.0
+  in_channels: 1
+  text_ctc_weight: 1.0
+  pinyin_ctc_weight: 0.0
   architecture_version: 2

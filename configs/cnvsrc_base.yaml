@@ -42,6 +42,7 @@ model:
   frontend_width: 64
   in_channels: 1
   lambda_ctc: 1.0        # v2 固定为 CTC
-  alpha: 0.0             # 解耦主方案：只训练无声调拼音 CTC
+  text_ctc_weight: 0.0   # 解耦主方案：只训练无声调拼音 CTC
+  pinyin_ctc_weight: 1.0
   label_smoothing: 0.0
   architecture_version: 2

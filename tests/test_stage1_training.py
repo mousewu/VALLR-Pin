@@ -4,6 +4,8 @@ import json
 from pathlib import Path
 
 import numpy as np
+import pytest
+import torch
 
 from vallr_pin.data.corpora import BuildConfig, CorpusSpec, build_manifests
 from vallr_pin.data.samplers import DistributedBucketBatchSampler
@@ -75,6 +77,10 @@ def test_trainer_checkpoint_resume(tmp_path):
     Trainer(cfg).fit()
     last = out / "ckpts" / "last.pt"
     assert last.exists()
+    assert (out / "ckpts" / "best_cer.pt").exists()
+    assert (out / "ckpts" / "best_ser.pt").exists()
+    metrics = json.loads((out / "metrics.jsonl").read_text().splitlines()[-1])
+    assert metrics["dev"]["text_oov_rate"] is not None
     cfg.epochs = 2; cfg.resume = str(last)
     resumed = Trainer(cfg)
     assert resumed.start_epoch == 2 and resumed.step > 0
@@ -100,3 +106,46 @@ def test_pinyin_only_decode_does_not_use_untrained_character_head(tmp_path):
     assert rows[0]["nbest"] == [] and rows[0]["pinyin_nbest"]
     stats = json.loads((tmp_path / "decode.stats.json").read_text())
     assert stats["cer_top1"] is None and stats["cer_oracle"] is None
+
+
+def test_text_only_decode_does_not_use_untrained_pinyin_head(tmp_path):
+    text = "我的手机"
+    tok = DualTokenizer.build_from_texts([text])
+    cfg = VallrPinConfig(char_vocab_size=len(tok.char), pinyin_vocab_size=len(tok.pinyin),
+                         d_model=16, heads=2, ffn=32, enc_layers=1,
+                         frontend_width=4, sanm_kernel=3,
+                         text_ctc_weight=1.0, pinyin_ctc_weight=0.0)
+    model = VallrPin(cfg)
+    video = tmp_path / "u.npy"; _npy(video, 16)
+    manifest = tmp_path / "manifest.jsonl"
+    manifest.write_text(json.dumps({"id": "u", "video": str(video), "text": text,
+                                    "n_frames": 16}, ensure_ascii=False) + "\n")
+    output = tmp_path / "decode.jsonl"
+    rows = decode_manifest(model, tok, DecodeConfig(
+        manifest=str(manifest), out_jsonl=str(output), beam=2, nbest=2,
+        crop_size=32, device="cpu"))
+    assert rows[0]["nbest"] and rows[0]["pinyin"] == []
+    stats = json.loads((tmp_path / "decode.stats.json").read_text())
+    assert stats["cer_top1"] is not None and stats["pinyin_ser"] is None
+    assert stats["text_oov_rate"] == 0.0
+
+
+def test_explicit_ctc_weights_train_only_requested_heads():
+    cfg = VallrPinConfig(char_vocab_size=8, pinyin_vocab_size=9,
+                         d_model=16, heads=2, ffn=32, enc_layers=1,
+                         frontend_width=4, sanm_kernel=3,
+                         text_ctc_weight=1.0, pinyin_ctc_weight=0.0)
+    model = VallrPin(cfg)
+    video = torch.randn(2, 8, 1, 32, 32)
+    lens = torch.tensor([8, 8])
+    chars = torch.tensor([[3, 4], [4, 5]])
+    pinyin = torch.tensor([[3, 4], [4, 5]])
+    out = model(video, lens, chars, torch.tensor([2, 2]),
+                pinyin, torch.tensor([2, 2]))
+    out["loss"].backward()
+    assert model.char_ctc.weight.grad is not None
+    assert model.pinyin_ctc.weight.grad is None
+    assert cfg.head_mode == "text" and out["loss_pinyin"].item() == 0.0
+
+    with pytest.raises(ValueError, match="must be set together"):
+        VallrPinConfig(text_ctc_weight=1.0).ctc_weights()

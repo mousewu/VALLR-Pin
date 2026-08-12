@@ -9,11 +9,9 @@ epochs: 50
 batch_size: 8
 bucket_size: 40
 epoch_samples: 0
-# Prevent the much larger CN-CVS from erasing CMLR. These are corpus sampling
-# probabilities, not loss weights. Add CNC only after reliable pseudo labels.
-source_weights:
-  cn_cvs: 0.70
-  cmlr: 0.30
+# Natural corpus proportions by default. Add explicit source weights only when
+# every named source is present in the built manifest.
+source_weights: {}
 accum_steps: 4
 lr: 5.0e-4
 warmup_steps: 10000
@@ -35,6 +33,7 @@ save_every: 2
 keep_ckpts: 8
 eval_every: 1
 selection_metric: ser
+save_best_per_metric: true
 log_every: 50
 seed: 2026
 
@@ -55,7 +54,8 @@ model:
   frontend: resnet18
   frontend_width: 64
   in_channels: 1
-  alpha: 0.1
+  text_ctc_weight: 0.1
+  pinyin_ctc_weight: 0.9
   lambda_ctc: 1.0
   char_dec_layers: 0
   pinyin_dec_layers: 0

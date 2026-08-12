@@ -2,7 +2,7 @@
 # 本地数据、公开视频、字幕、派生张量、报告和数据库均不分发。
 data/*
 !data/README.md
-models/
+/models/
 harvest/
 
 # 论文 PDF 不随仓库重新分发；README 使用论文公开链接。

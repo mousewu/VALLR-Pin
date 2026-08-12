@@ -207,7 +207,9 @@ def cmd_pipeline(args):
                                             char_dec_layers=args.dec_layers,
                                             pinyin_dec_layers=2, frontend="resnet18",
                                             frontend_width=args.frontend_width,
-                                            dropout=0.1, sanm_kernel=7, alpha=0.0))
+                                            dropout=0.1, sanm_kernel=7,
+                                            text_ctc_weight=0.0,
+                                            pinyin_ctc_weight=1.0))
     Trainer(tcfg).fit()
 
     hyp_dir = os.path.join(root, "hyps")
